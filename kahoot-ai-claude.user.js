@@ -20,13 +20,14 @@
   // ── SETTINGS ──────────────────────────────────────────────────
   // The API key isn't here: paste it in the panel. It's kept in the browser, so updating the script
   // doesn't wipe it and it can't end up in a repo.
-  // The panel's model menu. The first one is where it starts; after that it remembers. On a set of 70
-  // quiz questions at low effort, Haiku got 67 right, Sonnet 69 and Opus 70, with Haiku and Sonnet both
-  // answering in about 0.8 s and Opus in about 1.2 s. The niche ones (X-COM and other games) are where
-  // the smaller two slip, and a question costs about a tenth of a cent on Opus.
+  // The panel's model menu. The first one is where it starts; after that it remembers. At low effort and
+  // with web search, Sonnet and Opus each got all 104 questions right (70 general and niche, 34 about
+  // recent and local facts). Sonnet answers in about 2.7 s with nearly all under 4.5 s, Opus in about
+  // 3.2 s with some up to 9.5 s, and Sonnet costs half as much. Without search the 70 general ones went
+  // 67, 69 and 70 right for Haiku, Sonnet and Opus.
   const MODELS = [
-    { id: "claude-opus-5-5", name: "Opus 5.5" },
     { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
+    { id: "claude-opus-5-5", name: "Opus 5.5" },
     { id: "claude-haiku-5-5", name: "Haiku 5.5" },
     // { id: "claude-fable-5-1", name: "Fable 5.1" },
   ];
@@ -38,6 +39,14 @@
   const EFFORT = "low";
   // Web searches Claude may run per question.
   const MAX_SEARCHES = 2;
+  // What a searching Claude is told. Left to decide whether to search, it answers some recent or local
+  // facts (how many shops a chain has, when its first one opened) from memory, confidently and wrongly:
+  // Sonnet got 13 of 18 such questions right that way, and 18 of 18 when told to always search, which
+  // also kept it at 70 of 70 on general and niche ones.
+  const SEARCH_LEAD = "Always search the web before you answer, and answer from what you find. ";
+  // With search on, the same question is also asked without it, and this long after the question went
+  // live that quick answer is used if the search still hasn't come back.
+  const SEARCH_GRACE_MS = 4000;
   // How long to wait for Claude, and for Claude with web search, before giving up.
   const API_TIMEOUT_MS = 20000;
   const SEARCH_TIMEOUT_MS = 40000;
@@ -77,7 +86,7 @@
   const PREFS = {
     autoAnswer: { key: "kahoot-ai-auto-answer", fallback: true },   // send Claude's answer for you
     highlight:  { key: "kahoot-ai-highlight",   fallback: true },   // outline the answer on screen
-    webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
+    webSearch:  { key: "kahoot-ai-web-search",  fallback: true },   // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
     prefetch:   { key: "kahoot-ai-prefetch",    fallback: true },   // Menti: answer the whole quiz before it starts
     model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id, options: MODELS.map((m) => m.id) },
@@ -813,15 +822,14 @@ ${lettered(q.groups)}`,
 
   // Claude's answer: an answer's number for multiple choice, otherwise whatever that kind's read gives.
   // Null when the reply has no usable answer.
-  async function askClaude(data) {
+  async function askClaude(data, { search = prefs.webSearch } = {}) {
     if (!apiKey) {
       const error = new Error('No API key — paste it in the panel');
       error.fatal = true;
       throw error;
     }
-    const search = prefs.webSearch;
     let fast = prefs.fast && fastModel();
-    const prompt = `You are answering a quiz question. ${search ? 'If you are not sure of the answer you may search the web, but answer straight away when you know it. ' : ''}${kindOf(data).ask(data)}`;
+    const prompt = `You are answering a quiz question. ${search ? SEARCH_LEAD : ''}${kindOf(data).ask(data)}`;
     // Pictures go first, then the question that names them.
     const pictures = pictureBlocks(data);
     let inlined = false;
@@ -875,16 +883,69 @@ ${lettered(q.groups)}`,
 
   // One retry, since a single hiccup shouldn't cost the question. A bad key won't fix itself,
   // and a request that already timed out would only cost the same time again.
-  async function askWithRetry(data) {
+  async function askWithRetry(data, options) {
     for (let attempt = 0; ; attempt++) {
       try {
-        const answer = await askClaude(data);
+        const answer = await askClaude(data, options);
         if (answer !== null || attempt >= 1) return answer;
       } catch (e) {
         if (e.fatal || e.timeout || attempt >= 1) throw e;
       }
       await sleep(700);
     }
+  }
+
+  // ── ASKING, AND ASKING AHEAD ──────────────────────────────────
+  // With web search on, the searched answer is the one wanted (it's what gets a recent or local fact
+  // right), but a search can take several seconds, so the same question is also asked without searching.
+  // If the search is still out SEARCH_GRACE_MS after the question went live, the quick answer is used.
+  // track() follows a request without ever rejecting.
+  function track(promise) {
+    const t = { done: false, value: undefined, error: undefined };
+    t.promise = promise.then((value) => { t.done = true; t.value = value; }, (error) => { t.done = true; t.error = error; });
+    return t;
+  }
+
+  function startAsk(q) {
+    const search = prefs.webSearch;
+    return { deep: track(askWithRetry(q, { search })), quick: search ? track(askWithRetry(q, { search: false })) : null };
+  }
+
+  const usable = (t) => !!t && t.done && !t.error && t.value !== null;
+  // An answer is in hand: the searched one, or the quick one once the searched one has given up.
+  const ready = (entry) => usable(entry.deep) || (entry.deep.done && usable(entry.quick));
+
+  // The question is up and can be answered now.
+  function questionLive(q) {
+    if (SITE === 'aha') return ahaLive(q);
+    const el = buttonFor(0);
+    return !!el && !isDisabled(el) && locateButton(q, 0) >= 0;
+  }
+
+  // The answer to a started question: the searched one when it comes, else the quick one once the question
+  // has been live for the grace period, or at once if the search failed. Throws what the attempts threw.
+  async function answerBy(entry, q, r) {
+    const { deep, quick } = entry;
+    const grace = q.time ? Math.max(0, Math.min(SEARCH_GRACE_MS, q.time - prefs.margin)) : SEARCH_GRACE_MS;
+    let liveSince = 0;
+    while (!r.cancelled) {
+      if (usable(deep)) return deep.value;
+      if (deep.done) {
+        if (quick) await quick.promise;
+        if (usable(quick)) return quick.value;
+        if (deep.error || quick?.error) throw deep.error ?? quick.error;
+        return null;
+      }
+      if (usable(quick) && questionLive(q)) {
+        liveSince ||= Date.now();
+        if (Date.now() - liveSince >= grace) {
+          console.log(LOG, 'The search is taking long, using the quick answer');
+          return quick.value;
+        }
+      }
+      await sleep(40);
+    }
+    return null;
   }
 
   // ── ANSWER AHEAD ──────────────────────────────────────────────
@@ -894,7 +955,7 @@ ${lettered(q.groups)}`,
   // and settings, so changing the model asks again.
   const PREFETCH_PARALLEL = 2;
   const PREFETCH_MAX = 60;
-  const answerCache = new Map(); // key -> { promise, done }
+  const answerCache = new Map(); // key -> { deep, quick }
   let prefetching = 0;
   let prefetchTimer = 0;
   let prefetchHalted = false; // the key was refused: stop until there's a new one
@@ -909,10 +970,10 @@ ${lettered(q.groups)}`,
     const key = cacheKey(q);
     let entry = answerCache.get(key);
     if (!entry) {
-      entry = { done: false, promise: askWithRetry(q) };
+      entry = startAsk(q);
       answerCache.set(key, entry);
-      // An answer that didn't come isn't kept: it's asked again when the question is up.
-      entry.promise.then((answer) => { if (answer === null) answerCache.delete(key); else entry.done = true; }, () => answerCache.delete(key));
+      // Nothing usable at the end isn't kept: it's asked again when the question is up.
+      Promise.all([entry.deep.promise, entry.quick?.promise]).then(() => { if (!ready(entry)) answerCache.delete(key); });
     }
     return entry;
   }
@@ -938,19 +999,17 @@ ${lettered(q.groups)}`,
       prefetching++;
       const started = Date.now();
       // Only a finished answer starts the next one, so a failing connection can't loop.
-      askCached(data).promise.then(
-        (answer) => {
-          prefetching--;
-          if (answer === null) return;
-          console.log(LOG, `Asked ahead (${((Date.now() - started) / 1000).toFixed(1)}s):`, q.question, "→", kindOf(data).show(data, answer));
+      const { deep } = askCached(data);
+      deep.promise.then(() => {
+        prefetching--;
+        if (usable(deep)) {
+          console.log(LOG, `Asked ahead (${((Date.now() - started) / 1000).toFixed(1)}s):`, q.question, "→", kindOf(data).show(data, deep.value));
           pumpPrefetch();
-        },
-        (e) => {
-          prefetching--;
-          if (e.fatal) prefetchHalted = true;
-          console.debug(LOG, "Couldn't ask ahead:", e.message);
+        } else {
+          if (deep.error?.fatal) prefetchHalted = true;
+          console.debug(LOG, "Couldn't ask ahead:", deep.error?.message ?? "no usable answer");
         }
-      );
+      });
     }
   }
 
@@ -1270,7 +1329,7 @@ ${lettered(q.groups)}`,
   const SWITCHES = [
     { name: 'autoAnswer', label: 'Auto-answer', hint: "Sends Claude's answer for you" },
     { name: 'highlight', label: 'Highlight answer', hint: 'A soft outline on the pick' },
-    { name: 'webSearch', label: 'Web search', hint: 'Slower, and each search is billed' },
+    { name: 'webSearch', label: 'Web search', hint: 'Recent and local facts. Each search is billed' },
     { name: 'fast', label: 'Fast mode', hint: 'Opus 5.5 only, at twice the price' },
     { name: 'prefetch', label: 'Answer ahead', hint: 'Menti: asks the whole quiz before it starts' },
   ];
@@ -1983,11 +2042,11 @@ ${lettered(q.groups)}`,
       }
 
       // On Menti the answer may be there already (see ANSWER AHEAD), or on its way.
-      const ahead = SITE === 'menti' ? askCached(q) : null;
-      say(ahead?.done ? 'Answer ready (asked ahead)' : `Asking ${modelName(prefs.model)}${prefs.webSearch ? ' + web' : ''}... (${q.source})`, '#f0a500');
+      const entry = SITE === 'menti' ? askCached(q) : startAsk(q);
+      say(ready(entry) ? 'Answer ready (asked ahead)' : `Asking ${modelName(prefs.model)}${prefs.webSearch ? ' + web' : ''}... (${q.source})`, '#f0a500');
       show('—');
 
-      const answer = ahead ? await ahead.promise : await askWithRetry(q);
+      const answer = await answerBy(entry, q, r);
       if (r.cancelled) return;
       if (answer === null) {
         say("Couldn't get answer", '#f85149');
