@@ -491,8 +491,20 @@
     }
     return copy;
   }
+  // A picture's address. The slide's own picture comes in sizes; an option's is a plain address.
+  function pictureUrl(image) {
+    const address = typeof image === "string" ? image : image?.large ?? image?.original;
+    if (!address) return null;
+    try {
+      const url = new URL(address, location.href);
+      return /^https?:$/.test(url.protocol) ? url.href : null;
+    } catch (_) { return null; }
+  }
+
   // Parts as the asking side wants them, keeping the option's id and its place in the slide's list.
-  const numbered = (list, text) => list.map((item, index) => ({ index, text: cleanText(text(item)), id: item.id, slot: item.slot }));
+  const numbered = (list, text, image) => list.map((item, index) => ({
+    index, text: cleanText(text(item)), image: image ? pictureUrl(image(item)) : null, id: item.id, slot: item.slot,
+  }));
 
   // The quiz question on screen, from its rules screen on (so Claude can start before the timer does).
   // key is the slide, since two slides can ask the same thing, in brackets so slide 12 isn't a part of 123.
@@ -501,20 +513,20 @@
     if (!slide || slide.type !== "pickAnswer" || !Object.values(AHA_STATUS).includes(slide.quizStatus)) return null;
     const kind = slide.slideType ? AHA_KINDS[slide.slideType] : "choice";
     const q = { kind, slideId: String(slide.id), key: `ahaslides-slide[${slide.id}]`, question: cleanText(slide.title),
-      time: Number(slide.timeToAnswer) * 1000 || 0, source: "page" };
+      image: slide.image ? pictureUrl(slide.image) : null, time: Number(slide.timeToAnswer) * 1000 || 0, source: "page" };
     if (!kind) return { ...q, unsupported: slide.slideType };
     const options = (slide.SlideOptions ?? []).map((o, slot) => ({ id: o.id, slot, o }));
     try {
       if (kind === "choice") {
         q.kind = undefined;
         q.multi = !!slide.multipleChoice;
-        q.answers = numbered(options.filter(({ o }) => o.title || o.image || o.imageCropped), ({ o }) => o.title);
+        q.answers = numbered(options.filter(({ o }) => o.title || o.image || o.imageCropped), ({ o }) => o.title, ({ o }) => o.imageCropped || o.image);
       } else if (kind === "order") {
         q.items = numbered(shuffled(options.filter(({ id }) => id)), ({ o }) => o.title);
       } else if (kind === "match") {
         const pairs = options.filter(({ o }) => (o.title || o.image) && (o.pairTitle || o.pairImage));
-        q.items = numbered(pairs, ({ o }) => o.title);
-        q.matches = numbered(shuffled(pairs), ({ o }) => o.pairTitle);
+        q.items = numbered(pairs, ({ o }) => o.title, ({ o }) => o.imageCropped || o.image);
+        q.matches = numbered(shuffled(pairs), ({ o }) => o.pairTitle, ({ o }) => o.pairImageCropped || o.pairImage);
       } else if (kind === "categorise") {
         const groups = JSON.parse(slide.matchingQuestionOptions);
         q.groups = numbered(groups, (g) => g.value);
@@ -524,9 +536,11 @@
       console.debug(LOG, "Couldn't read the slide:", e.message);
       return null;
     }
-    // Claude only gets text, so a question or a part that's only a picture can't be answered.
+    // Pictures go to Claude too, but one whose address can't be read leaves nothing to go on.
     const parts = [q.answers, q.items, q.matches, q.groups].filter(Boolean).flat();
-    if (!q.question || parts.some((p) => !p.text) || (kind !== "text" && !parts.length)) return { ...q, unsupported: "picture" };
+    if ((!q.question && !q.image) || parts.some((p) => !p.text && !p.image) || (kind !== "text" && !parts.length)) {
+      return { ...q, unsupported: "picture" };
+    }
     return q;
   }
 
@@ -605,8 +619,14 @@
   //   match:      q.items and q.matches, answered with a match for each item, each match used once.
   //   categorise: q.items and q.groups, answered with a group for each item.
   // Items are numbered and the things they go with lettered, so the two can't be mixed up.
+  // The question and any part can also have a picture (q.image, p.image: its address), and a part can be
+  // only a picture. The list names each picture, and the pictures go along labelled the same way (see
+  // pictureBlocks).
   const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const listed = (parts, label = (i) => i) => parts.map((p) => `${label(p.index)}: ${p.text}`).join('\n');
+  const described = (p, label) => [p.text, p.image && `[picture ${label}]`].filter(Boolean).join(' ');
+  const listed = (parts, label = (i) => i) => parts.map((p) => `${label(p.index)}: ${described(p, label(p.index))}`).join('\n');
+  const asked = (q) => [q.question, q.image && "[the question's picture]"].filter(Boolean).join(' ');
+  const nameOf = (p) => p.text || 'a picture';
   const lettered = (parts) => listed(parts, (i) => LETTERS[i]);
   const PAIRS_HOW = 'Reply with ONLY one line per item, its number then its letter (for example 0: B). No explanation.';
 
@@ -633,7 +653,7 @@
         ? `More than one answer may be correct: pick every correct one and no wrong ones. Reply with ONLY the numbers of the correct answers (${q.answers.map((a) => a.index).join(', ')}), separated by commas. No explanation.`
         : `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.`}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Answers:
 ${listed(q.answers)}`,
@@ -645,12 +665,12 @@ ${listed(q.answers)}`,
         const numbers = answerNumbers(text);
         return numbers.length ? numbers[numbers.length - 1] : null;
       },
-      show: (q, pick) => [].concat(pick).map((index) => q.answers.find((a) => a.index === index)?.text || '?').join(', '),
+      show: (q, pick) => [].concat(pick).map((index) => nameOf(q.answers.find((a) => a.index === index))).join(', '),
     },
     text: {
       ask: (q) => `There are no answers to pick from: the answer is typed in, and checked against the expected one. Reply with ONLY the answer, as short as it can be put (usually a word, a name or a number). No explanation, no quotes, no full stop.
 
-Question: ${q.question}`,
+Question: ${asked(q)}`,
       // The last line, without quotes or bold around it, or a full stop after it.
       read: (q, text) => {
         const line = text.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
@@ -662,7 +682,7 @@ Question: ${q.question}`,
     order: {
       ask: (q) => `Put these items in the correct order. Reply with ONLY their numbers in that order, first to last, separated by commas (for example 2, 0, 1). No explanation.
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}`,
@@ -674,12 +694,12 @@ ${listed(q.items)}`,
         }
         return null;
       },
-      show: (q, order) => order.map((i) => q.items.find((p) => p.index === i).text).join(' → '),
+      show: (q, order) => order.map((i) => nameOf(q.items.find((p) => p.index === i))).join(' → '),
     },
     match: {
       ask: (q) => `Match each numbered item with the lettered one it goes with. Each letter goes with one item. ${PAIRS_HOW}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}
@@ -687,12 +707,12 @@ ${listed(q.items)}
 Matches:
 ${lettered(q.matches)}`,
       read: (q, text) => readPairs(q.items, q.matches, text, true),
-      show: (q, picks) => q.items.map((p) => `${p.text} = ${q.matches.find((m) => m.index === picks[p.index]).text}`).join('; '),
+      show: (q, picks) => q.items.map((p) => `${nameOf(p)} = ${nameOf(q.matches.find((m) => m.index === picks[p.index]))}`).join('; '),
     },
     categorise: {
       ask: (q) => `Sort each numbered item into the lettered group it belongs in. ${PAIRS_HOW}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}
@@ -709,6 +729,42 @@ ${lettered(q.groups)}`,
   };
   const kindOf = (q) => KINDS[q.kind ?? 'choice'];
 
+  // The question's pictures, each after a line saying whose it is, as the list in the question names it.
+  // Claude fetches them from their addresses.
+  function pictureBlocks(q) {
+    const labelled = [
+      ...(q.image ? [["The question's picture", q.image]] : []),
+      ...[q.answers, q.items].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${p.index}`, p.image]),
+      ...[q.matches, q.groups].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${LETTERS[p.index]}`, p.image]),
+    ];
+    return labelled.flatMap(([label, url]) => [{ type: 'text', text: `${label}:` }, { type: 'image', source: { type: 'url', url } }]);
+  }
+
+  // Some hosts won't hand their pictures to Claude. Then the page fetches them and sends them along as
+  // data, which works where the host lets other sites read its pictures.
+  async function inlinePictures(content) {
+    try {
+      return await Promise.all(content.map(async (block) => {
+        if (block.type !== 'image') return block;
+        const response = await fetch(block.source.url);
+        const blob = await response.blob();
+        const type = blob.type.replace('image/jpg', 'image/jpeg');
+        if (!response.ok || !/^image\/(jpeg|png|gif|webp)$/.test(type)) throw new Error(`${response.status} ${type || 'no type'}`);
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(',')[1]);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+        return { type: 'image', source: { type: 'base64', media_type: type, data } };
+      }));
+    } catch (e) {
+      const error = new Error(`Couldn't send the pictures to Claude (${e.message})`);
+      error.fatal = true; // trying again won't load them either
+      throw error;
+    }
+  }
+
   // Claude's answer: an answer's number for multiple choice, otherwise whatever that kind's read gives.
   // Null when the reply has no usable answer.
   async function askClaude(data) {
@@ -720,11 +776,14 @@ ${lettered(q.groups)}`,
     const search = prefs.webSearch;
     let fast = prefs.fast && fastModel();
     const prompt = `You are answering a quiz question. ${search ? 'If you are not sure of the answer you may search the web, but answer straight away when you know it. ' : ''}${kindOf(data).ask(data)}`;
+    // Pictures go first, then the question that names them.
+    const pictures = pictureBlocks(data);
+    let inlined = false;
 
     const body = {
       model: prefs.model,
       max_tokens: TOKENS_BY_EFFORT[prefs.effort] + (search ? SEARCH_EXTRA_TOKENS : 0),
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: pictures.length ? [...pictures, { type: 'text', text: prompt }] : prompt }],
       output_config: { effort: prefs.effort },
     };
     if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: prefs.maxSearches }];
@@ -738,6 +797,12 @@ ${lettered(q.groups)}`,
         console.log(LOG, 'Fast mode was refused, using normal speed:', reply.error?.message ?? `HTTP ${response.status}`);
         fast = false;
         ({ response, json: reply } = await callApi(body, false, timeoutMs));
+      }
+      if (response.status === 400 && pictures.length && !inlined && /image|url|download|fetch|media/i.test(reply.error?.message ?? '')) {
+        console.log(LOG, "Claude couldn't fetch the pictures, sending them from the page:", reply.error?.message);
+        inlined = true;
+        body.messages[0] = { role: 'user', content: await inlinePictures(body.messages[0].content) };
+        ({ response, json: reply } = await callApi(body, fast, timeoutMs));
       }
       if (response.status === 401) {
         const error = new Error('Invalid API key — paste a new one in the panel');
@@ -983,11 +1048,17 @@ ${lettered(q.groups)}`,
       vm.sortOption();
       return true;
     },
+    // The list a match is picked from belongs to a component that holds its options in the same order,
+    // so the wanted match is found by its option, which works for a picture as well as for text.
     match: async (q, picks, r) => {
       for (const item of q.items) {
-        const want = textKey(q.matches.find((m) => m.index === picks[item.index]).text);
+        const match = q.matches.find((m) => m.index === picks[item.index]);
         const slot = AHA_CONTROLS.match(q)?.[item.slot];
-        if (!(await pickFromList(q, r, slot, 'audience-quiz-match-pairs-pair-item', (el) => textIn(el, '.pair-title-text') === want))) return false;
+        const wanted = (el, i) => {
+          const list = vueOwner(el, (c) => Array.isArray(c.matchPairsOption))?.matchPairsOption;
+          return list ? String(list[i]?.id) === String(match.id) : textIn(el, '.pair-title-text') === textKey(match.text);
+        };
+        if (!(await pickFromList(q, r, slot, 'audience-quiz-match-pairs-pair-item', wanted))) return false;
       }
       return true;
     },
