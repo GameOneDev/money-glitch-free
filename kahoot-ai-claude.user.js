@@ -67,7 +67,8 @@
     webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
     model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id, options: MODELS.map((m) => m.id) },
-    // "hidden" folds the panel to the ⚡ button; "off" hides that too, until Alt+K or a tap on the badge.
+    // "hidden" folds the panel to the ⚡ button; "off" makes that button invisible, though a tap on it
+    // still works.
     ui:         { key: "kahoot-ai-ui",          fallback: "compact", options: ["compact", "open", "hidden", "off"] },
     // The Advanced section. Times are kept in milliseconds, and the panel shows seconds.
     delayMin:      { key: "kahoot-ai-delay-min",      fallback: ANSWER_DELAY_MIN,  min: 0,     max: 30000 },
@@ -601,6 +602,7 @@ ${answersText}`;
       width: 44px; height: 44px; border: 1px solid rgba(88, 166, 255, .35); border-radius: 50%; padding: 0;
       background: rgba(88, 166, 255, .15); color: rgba(88, 166, 255, .8); font-size: 20px; font-weight: 700; cursor: pointer;
     }
+    .fab.ghost { opacity: 0; } /* still takes taps */
 
     .bar { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 6px 6px 6px 12px; }
     .logo { flex: none; color: #58a6ff; font-size: 18px; }
@@ -689,7 +691,8 @@ ${answersText}`;
   function renderUi() {
     if (!root) return;
     const state = uiState();
-    $('kahoot-fab').hidden = state !== 'hidden' || !!badge;
+    $('kahoot-fab').hidden = panelShown() || !!badge;
+    $('kahoot-fab').classList.toggle('ghost', state === 'off');
     $('kahoot-panel').hidden = !panelShown();
     $('kahoot-settings').hidden = state !== 'open';
     $('kahoot-toggle').setAttribute('aria-expanded', String(state === 'open'));
@@ -844,7 +847,7 @@ ${answersText}`;
           </div>
           <button id="kahoot-toggle" class="icon" type="button" aria-label="Settings" aria-expanded="false">⚙</button>
           <button id="kahoot-off" class="icon" type="button" aria-label="Hide completely"
-            title="Hide completely. Alt+K, or a tap on the Quiz badge, brings it back">⊘</button>
+            title="Hide completely. A tap on this corner, Alt+K or a tap on the Quiz badge brings it back">⊘</button>
           <button id="kahoot-close" class="icon" type="button" aria-label="Hide">×</button>
         </div>
         <div id="kahoot-settings" class="settings" hidden>
@@ -917,8 +920,8 @@ ${answersText}`;
       setStatus('API key removed');
     });
 
-    // Settings fold open from the bar, and the whole panel folds away to a small ⚡ button, or out of
-    // sight altogether.
+    // Settings fold open from the bar, and the whole panel folds away to a small ⚡ button, or to the
+    // same button made invisible.
     $('kahoot-toggle').addEventListener('click', () => setPref('ui', uiState() === 'open' ? 'compact' : 'open'));
     $('kahoot-off').addEventListener('click', () => setPref('ui', 'off'));
     $('kahoot-close').addEventListener('click', () => setPref('ui', 'hidden'));
