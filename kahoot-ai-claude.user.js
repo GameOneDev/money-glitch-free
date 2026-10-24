@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Answers Kahoot and Mentimeter (menti.com) quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer. A choice of model, optional web search and fast mode, and an optional answer highlight.
+// @version      4.1
+// @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise. A choice of model, optional web search and fast mode, and an optional answer highlight.
 // @match        https://kahoot.it/*
 // @match        https://www.menti.com/*
 // @match        https://menti.com/*
+// @match        https://audience.ahaslides.com/*
+// @match        https://audience.ahaslides.eu/*
 // @grant        none
 // @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/GameOneDev/money-glitch-free/main/kahoot-ai-claude.user.js
@@ -57,10 +59,12 @@
   // arriving this soon after, is that and not a new question.
   const REPEAT_WINDOW_MS = 10000;
 
-  // Which game this page is. Most of the script is the same for both; the parts that read the question
-  // and send the answer differ.
-  const SITE = /(^|\.)menti\.com$/.test(location.hostname) ? "menti" : "kahoot";
-  const LOG = SITE === "menti" ? "[Menti AI]" : "[Kahoot AI]";
+  // Which game this page is. Most of the script is the same for all of them; the parts that read the
+  // question and send the answer differ.
+  const SITE = /(^|\.)menti\.com$/.test(location.hostname) ? "menti"
+    : /(^|\.)ahaslides\.(com|eu)$/.test(location.hostname) ? "aha"
+    : "kahoot";
+  const LOG = { menti: "[Menti AI]", aha: "[AhaSlides AI]", kahoot: "[Kahoot AI]" }[SITE];
   const API_URL = "https://api.anthropic.com/v1/messages";
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -274,12 +278,13 @@
       return /(^|\.)(menti|mentimeter)\.com$/.test(hostname) && !/\.(js|css|png|jpe?g|gif|svg|webp|woff2?|ico)$/i.test(pathname);
     } catch (_) { return false; }
   }
-  const isWatchedUrl = (url) => (SITE === "menti" ? isMentiUrl(url) : isCometdUrl(url));
+  // AhaSlides' traffic isn't read: its question comes from the page (see READ AHASLIDES' SLIDE).
+  const isWatchedUrl = (url) => (SITE === "menti" ? isMentiUrl(url) : SITE === "kahoot" && isCometdUrl(url));
 
   // Kahoot's traffic is always JSON. Mentimeter's is anything, and its reader takes text as it comes.
   function onWire(payload, source) {
     if (SITE === "menti") handleMentiData(payload);
-    else handleKahootMessages(typeof payload === "string" ? JSON.parse(payload) : payload, source);
+    else if (SITE === "kahoot") handleKahootMessages(typeof payload === "string" ? JSON.parse(payload) : payload, source);
   }
 
   // HTTP: XMLHttpRequest, which is what CometD uses, and fetch in case that changes. Mentimeter's
@@ -323,8 +328,8 @@
         if (typeof event.data === "string") onWire(event.data, "ws");
       } catch (e) { console.debug(LOG, "WS parse error:", e.message); }
     });
-    // Answers go over the socket only on Kahoot. Mentimeter's is only listened to.
-    if (SITE === "menti") return ws;
+    // Answers go over the socket only on Kahoot. Mentimeter's is only listened to, and AhaSlides' not even that.
+    if (SITE !== "kahoot") return ws;
     activeWs = ws;
 
     // Watch what Kahoot's own client sends: that's where the client id and message numbers come from,
@@ -359,12 +364,13 @@
   });
 
   // ── READ THE PAGE ─────────────────────────────────────────────
-  // The answer buttons on screen, by position. Kahoot marks them; Mentimeter's are found by their text.
-  const buttonFor = (index) => SITE === "menti"
-    ? mentiScreen().els[index] ?? null
+  // The answer buttons on screen, by position. Kahoot and AhaSlides mark them; Mentimeter's are found
+  // by their text.
+  const buttonFor = (index) => SITE === "menti" ? mentiScreen().els[index] ?? null
+    : SITE === "aha" ? ahaEls("audience-quiz-option")[index] ?? null
     : document.querySelector(`[data-functional-selector="answer-${index}"]`);
-  const choiceTextEl = (index) => SITE === "menti"
-    ? mentiScreen().els[index] ?? null
+  const choiceTextEl = (index) => SITE === "menti" ? mentiScreen().els[index] ?? null
+    : SITE === "aha" ? ahaEls("audience-quiz-option")[index] ?? null
     : document.querySelector(`[data-functional-selector="question-choice-text-${index}"]`);
   const isDisabled = (el) => !!el.disabled || el.getAttribute("aria-disabled") === "true";
   const isVisible = (el) => el.getClientRects().length > 0;
@@ -443,8 +449,85 @@
     return { question: q.question, answers: q.answers };
   }
 
+  // ── READ AHASLIDES' SLIDE ─────────────────────────────────────
+  // AhaSlides' audience page is a Vue app, and its store holds the slide on screen: its type, its parts,
+  // and where its quiz is. That's what the page draws from, so read the question there. Every quiz slide
+  // is a "pickAnswer"; slideType says which kind (none, or "imageChoice", is multiple choice). Its answer
+  // controls carry data-testid attributes, which is how they're found.
+  const AHA_STATUS = { rules: 2, countdown: 3, question: 4 };
+  const AHA_KINDS = { imageChoice: "choice", typeAnswer: "text", correctOrder: "order", matchPairs: "match", categorise: "categorise" };
+  const ahaEls = (testid) => [...document.querySelectorAll(`[data-testid="${testid}"]`)];
+
+  // Vue puts each component on its root element as __vue__, and every component has the store.
+  let ahaStoreFound = null;
+  function ahaSlide() {
+    if (!ahaStoreFound) {
+      for (const el of document.body?.children ?? []) {
+        if (el.__vue__?.$store) { ahaStoreFound = el.__vue__.$store; break; }
+      }
+    }
+    return ahaStoreFound?.state?.slide ?? null;
+  }
+
+  // The component an element belongs to, or the nearest one above it that passes the test.
+  function vueOwner(el, test) {
+    while (el && !el.__vue__) el = el.parentElement;
+    for (let vm = el?.__vue__; vm; vm = vm.$parent) if (test(vm)) return vm;
+    return null;
+  }
+
+  // The page keeps a correct-order slide's items in the right order, and each match with its item, so
+  // they're shuffled before Claude sees them: it should get them as a player does.
+  function shuffled(list) {
+    const copy = [...list];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  }
+  // Parts as the asking side wants them, keeping the option's id and its place in the slide's list.
+  const numbered = (list, text) => list.map((item, index) => ({ index, text: cleanText(text(item)), id: item.id, slot: item.slot }));
+
+  // The quiz question on screen, from its rules screen on (so Claude can start before the timer does).
+  // key is the slide, since two slides can ask the same thing, in brackets so slide 12 isn't a part of 123.
+  function ahaQuestionOnScreen() {
+    const slide = ahaSlide();
+    if (!slide || slide.type !== "pickAnswer" || !Object.values(AHA_STATUS).includes(slide.quizStatus)) return null;
+    const kind = slide.slideType ? AHA_KINDS[slide.slideType] : "choice";
+    const q = { kind, slideId: String(slide.id), key: `ahaslides-slide[${slide.id}]`, question: cleanText(slide.title),
+      time: Number(slide.timeToAnswer) * 1000 || 0, source: "page" };
+    if (!kind) return { ...q, unsupported: slide.slideType };
+    const options = (slide.SlideOptions ?? []).map((o, slot) => ({ id: o.id, slot, o }));
+    try {
+      if (kind === "choice") {
+        q.kind = undefined;
+        q.multi = !!slide.multipleChoice;
+        q.answers = numbered(options.filter(({ o }) => o.title || o.image || o.imageCropped), ({ o }) => o.title);
+      } else if (kind === "order") {
+        q.items = numbered(shuffled(options.filter(({ id }) => id)), ({ o }) => o.title);
+      } else if (kind === "match") {
+        const pairs = options.filter(({ o }) => (o.title || o.image) && (o.pairTitle || o.pairImage));
+        q.items = numbered(pairs, ({ o }) => o.title);
+        q.matches = numbered(shuffled(pairs), ({ o }) => o.pairTitle);
+      } else if (kind === "categorise") {
+        const groups = JSON.parse(slide.matchingQuestionOptions);
+        q.groups = numbered(groups, (g) => g.value);
+        q.items = numbered(shuffled(groups.flatMap((g) => g.options)), (o) => o.value);
+      }
+    } catch (e) {
+      console.debug(LOG, "Couldn't read the slide:", e.message);
+      return null;
+    }
+    // Claude only gets text, so a question or a part that's only a picture can't be answered.
+    const parts = [q.answers, q.items, q.matches, q.groups].filter(Boolean).flat();
+    if (!q.question || parts.some((p) => !p.text) || (kind !== "text" && !parts.length)) return { ...q, unsupported: "picture" };
+    return q;
+  }
+
   function getQuestionDataFromDom() {
     if (SITE === "menti") return mentiQuestionOnScreen();
+    if (SITE === "aha") return ahaQuestionOnScreen();
     const question = document.querySelector('[data-functional-selector="block-title"]')?.textContent?.trim();
     if (!question) return null;
 
@@ -510,7 +593,8 @@
   }
 
   // Every kind of question but multiple choice. A question with no kind is multiple choice: q.answers,
-  // answered with one of their numbers. The rest list their parts the same way, as { index, text }.
+  // answered with one of their numbers, or with all the right ones when q.multi says several can be
+  // right. The rest list their parts the same way, as { index, text }.
   //   text:       nothing to pick from; the answer is typed.
   //   order:      q.items, answered with their numbers first to last.
   //   match:      q.items and q.matches, answered with a match for each item, each match used once.
@@ -540,18 +624,23 @@
   // show the answer in the panel.
   const KINDS = {
     choice: {
-      ask: (q) => `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.
+      ask: (q) => `${q.multi
+        ? `More than one answer may be correct: pick every correct one and no wrong ones. Reply with ONLY the numbers of the correct answers (${q.answers.map((a) => a.index).join(', ')}), separated by commas. No explanation.`
+        : `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.`}
 
 Question: ${q.question}
 
 Answers:
 ${listed(q.answers)}`,
       // The last whole number that is one of the answers, so a "2007" in its words can't be mistaken for one.
+      // With several right, every answer's number on the last line that has any.
       read: (q, text) => {
-        const numbers = (text.match(/\b\d+\b/g) || []).map(Number).filter((n) => q.answers.some((a) => a.index === n));
+        const answerNumbers = (line) => (line.match(/\b\d+\b/g) || []).map(Number).filter((n) => q.answers.some((a) => a.index === n));
+        if (q.multi) return text.split('\n').reverse().map((line) => [...new Set(answerNumbers(line))]).find((picks) => picks.length) ?? null;
+        const numbers = answerNumbers(text);
         return numbers.length ? numbers[numbers.length - 1] : null;
       },
-      show: (q, index) => q.answers.find((a) => a.index === index)?.text || '?',
+      show: (q, pick) => [].concat(pick).map((index) => q.answers.find((a) => a.index === index)?.text || '?').join(', '),
     },
     text: {
       ask: (q) => `There are no answers to pick from: the answer is typed in, and checked against the expected one. Reply with ONLY the answer, as short as it can be put (usually a word, a name or a number). No explanation, no quotes, no full stop.
@@ -778,6 +867,152 @@ ${lettered(q.groups)}`,
       }
     }
     return 'tapped';
+  }
+
+  // AhaSlides: answer like a player, then press Submit. Options are tapped and a short answer typed in.
+  // A match or a group is picked from the list that opens when its item is tapped. Items to put in order
+  // are dragged, and a drag can't be faked reliably, so their order goes to the list's own component
+  // instead, the way a finished drag hands it over.
+  const ahaLive = (q) => {
+    const slide = ahaSlide();
+    return !!slide && String(slide.id) === q.slideId && slide.quizStatus === AHA_STATUS.question;
+  };
+  const ahaOption = (id) => ahaEls('audience-quiz-option').find((el) => el.dataset.id === String(id)) ?? null;
+  const ahaDisabled = (el) => isDisabled(el) || !!el.closest('.aha-option--disabled, .match-pair-content--disabled');
+  const textIn = (el, selector) => textKey(el.querySelector(selector)?.textContent);
+
+  // Polls until get() gives something, or the time is up.
+  async function waitFor(get, ms) {
+    for (const deadline = Date.now() + ms; ; await sleep(50)) {
+      const value = get();
+      if (value || Date.now() >= deadline) return value;
+    }
+  }
+
+  // Each kind's controls, once they're on screen and take input; null until then. A match-pairs slide
+  // has an item on screen for every option, in the slide's order, so its items are found by place.
+  const AHA_CONTROLS = {
+    choice: (q, pick) => {
+      const els = [].concat(pick).map((index) => ahaOption(q.answers.find((a) => a.index === index).id));
+      return els.every((el) => el && !ahaDisabled(el)) ? els : null;
+    },
+    text: () => ahaEls('audience-quiz-type-answer-input').find((el) => !ahaDisabled(el)) ?? null,
+    order: () => {
+      const list = ahaEls('audience-quiz-correct-order-draggable-list')[0];
+      const vm = list && vueOwner(list, (c) => Array.isArray(c.correctOrderOptions) && typeof c.sortOption === 'function');
+      return vm && !vm.isDisableDrag ? vm : null;
+    },
+    match: (q) => {
+      const els = ahaEls('audience-quiz-match-pairs-option-item');
+      return els.length > Math.max(...q.items.map((p) => p.slot)) && !ahaDisabled(els[0]) ? els : null;
+    },
+    categorise: (q) => {
+      const els = ahaEls('audience-quiz-categorise-option-item');
+      return els.length >= q.items.length && !ahaDisabled(els[0]) ? els : null;
+    },
+  };
+
+  // Wait for this question's controls: they come up when its timer starts. For multiple choice, returns
+  // where the (first) pick is on screen, for the highlight; otherwise null. -1 if they never come up, or
+  // the slide has moved on to its results or another slide.
+  async function waitForAhaControls(q, answer, r) {
+    for (const deadline = Date.now() + BUTTON_WAIT_MS; !r.cancelled && Date.now() < deadline; await sleep(100)) {
+      const slide = ahaSlide();
+      if (String(slide?.id) !== q.slideId || slide.quizStatus > AHA_STATUS.question) break;
+      if (!ahaLive(q)) continue;
+      r.liveAt ||= Date.now();
+      const controls = AHA_CONTROLS[q.kind ?? 'choice'](q, answer);
+      if (!controls) continue;
+      console.log(LOG, `Answer controls are up after ${Date.now() - r.startedAt}ms`);
+      return q.kind ? null : ahaEls('audience-quiz-option').indexOf(controls[0]);
+    }
+    if (!r.cancelled) console.log(LOG, 'The answer controls never came up');
+    return -1;
+  }
+
+  // Tap an item, wait for the list of matches or groups it opens, and tap the one wanted there. Picking
+  // one closes the list.
+  async function pickFromList(q, r, item, listTestid, wanted) {
+    if (!item || r.cancelled || !ahaLive(q)) return false;
+    item.click();
+    const list = await waitFor(() => { const els = ahaEls(listTestid); return els.length ? els : null; }, 2000);
+    const choice = list?.find(wanted);
+    if (!choice) {
+      document.querySelector('[data-testid^="audience-quiz-"][data-testid$="-overlay"]')?.click();
+      return false;
+    }
+    choice.click();
+    await waitFor(() => !ahaEls(listTestid).length, 2000);
+    return true;
+  }
+
+  // Each kind's way in. True when it's all entered.
+  const AHA_ENTER = {
+    // Taps one at a time, since the page works out each tap's result from the one before. With several
+    // right, an option that's picked but shouldn't be is tapped off.
+    choice: async (q, pick) => {
+      const want = AHA_CONTROLS.choice(q, pick);
+      if (!want) return false;
+      for (const el of ahaEls('audience-quiz-option')) {
+        const picked = el.classList.contains('aha-option--selected');
+        if (want.includes(el) ? picked : !(picked && q.multi)) continue;
+        el.click();
+        await sleep(150);
+      }
+      return true;
+    },
+    text: async (q, answer) => {
+      const input = AHA_CONTROLS.text();
+      if (!input) return false;
+      input.value = answer;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    },
+    order: async (q, order) => {
+      const vm = AHA_CONTROLS.order();
+      if (!vm) return false;
+      const byId = new Map(vm.correctOrderOptions.map((o) => [String(o.id), o]));
+      const items = order.map((index) => byId.get(String(q.items.find((p) => p.index === index).id)));
+      if (items.length !== byId.size || items.some((o) => !o)) return false;
+      vm.correctOrderOptions = items;
+      vm.sortOption();
+      return true;
+    },
+    match: async (q, picks, r) => {
+      for (const item of q.items) {
+        const want = textKey(q.matches.find((m) => m.index === picks[item.index]).text);
+        const slot = AHA_CONTROLS.match(q)?.[item.slot];
+        if (!(await pickFromList(q, r, slot, 'audience-quiz-match-pairs-pair-item', (el) => textIn(el, '.pair-title-text') === want))) return false;
+      }
+      return true;
+    },
+    // The items are on screen in their own shuffled order, so they're found by their text. Two items can
+    // read the same; each is used once.
+    categorise: async (q, picks, r) => {
+      const used = new Set();
+      for (const item of q.items) {
+        const els = AHA_CONTROLS.categorise(q) ?? [];
+        const at = els.findIndex((el, i) => !used.has(i) && textIn(el, '.pair-left-text') === textKey(item.text));
+        used.add(at);
+        const want = textKey(q.groups.find((g) => g.index === picks[item.index]).text);
+        if (!(await pickFromList(q, r, els[at], 'audience-quiz-categorise-category-item', (el) => textIn(el, '.pair-title-text') === want))) return false;
+      }
+      return true;
+    },
+  };
+
+  // Returns 'entered', 'missed' (the question screen was already gone) or 'stuck' (some of it couldn't be
+  // entered, or Submit never came on).
+  async function enterAhaAnswer(q, answer, r) {
+    if (!ahaLive(q)) return 'missed';
+    const entered = await AHA_ENTER[q.kind ?? 'choice'](q, answer, r);
+    if (!ahaLive(q)) return 'missed';
+    if (!entered) return 'stuck';
+    const submit = await waitFor(() => ahaEls('audience-quiz-submit-button').find((el) => !isDisabled(el)), 3000);
+    if (!submit) return ahaLive(q) ? 'stuck' : 'missed';
+    submit.click();
+    console.log(LOG, 'Entered the answer and pressed Submit');
+    return 'entered';
   }
 
   // ── ANSWER HIGHLIGHT ──────────────────────────────────────────
@@ -1246,17 +1481,21 @@ ${lettered(q.groups)}`,
   // The question the page is showing that we've already dealt with. Ignored until it leaves the screen.
   let domGate = null;
 
-  const isRepeat = (text) => {
+  // A question is known by its text, or on AhaSlides by its slide.
+  const keyOf = (q) => q.key ?? textKey(q.question);
+  const fromWire = (q) => q.source === 'ws' || q.source === 'http';
+
+  const isRepeat = (key) => {
     if (!round) return false;
-    const key = textKey(text);
     if (!round.keys.some((k) => sameText(k, key))) return false;
     return !round.over || Date.now() - round.overAt < REPEAT_WINDOW_MS;
   };
 
-  // The round ends when its answer buttons have been on screen and are gone again.
+  // The round ends when its answer buttons have been on screen and are gone again. On AhaSlides, when
+  // its slide has been on the question screen and has left it.
   function trackRound() {
     if (!round || round.over) return;
-    if (buttonFor(0)) round.sawButtons = true;
+    if (SITE === 'aha' ? ahaLive(round.q) : buttonFor(0)) round.sawButtons = true;
     else if (round.sawButtons) {
       round.over = true;
       round.overAt = Date.now();
@@ -1268,33 +1507,33 @@ ${lettered(q.groups)}`,
     if (incoming && incoming.seq > lastSeq) {
       const wire = incoming;
       lastSeq = wire.seq;
-      if (!isRepeat(wire.question)) return wire;
+      if (!isRepeat(textKey(wire.question))) return wire;
       console.debug(LOG, 'Same question again, not asking twice:', wire.question);
     }
 
     const dom = getQuestionDataFromDom();
     if (!dom) { domGate = null; return null; }
-    const key = textKey(dom.question);
+    const key = keyOf(dom);
     if (domGate && sameText(domGate, key)) return null;
     domGate = key;
-    if (isRepeat(dom.question)) return null;
+    if (isRepeat(key)) return null;
     // The open round came from the wire and this is the first question the page shows: it's that
     // question, worded differently. (A stale one from before the round began is held by domGate.)
-    if (round && !round.over && !round.aliased && round.q.source !== 'dom') {
+    if (round && !round.over && !round.aliased && fromWire(round.q)) {
       round.keys.push(key);
       round.aliased = true;
       console.debug(LOG, 'Page shows the question worded differently:', dom.question);
       return null;
     }
-    return { ...dom, source: 'dom' };
+    return { source: 'dom', ...dom };
   }
 
   function startRound(q) {
     if (round) round.cancelled = true; // an older question must not answer for this one
     clearMark();
     const dom = getQuestionDataFromDom();
-    if (dom) domGate = textKey(dom.question);
-    round = { q, keys: [textKey(q.question)], aliased: false, startedAt: Date.now(), sawButtons: false, over: false, overAt: 0, cancelled: false, pick: undefined };
+    if (dom) domGate = keyOf(dom);
+    round = { q, keys: [keyOf(q)], aliased: false, startedAt: Date.now(), liveAt: 0, sawButtons: false, over: false, overAt: 0, cancelled: false, pick: undefined };
     roundsStarted++;
     handleQuestion(q, round);
   }
@@ -1320,27 +1559,26 @@ ${lettered(q.groups)}`,
       say(`Asking ${modelName(prefs.model)}${prefs.webSearch ? ' + web' : ''}... (${q.source})`, '#f0a500');
       show('—');
 
-      const index = await askWithRetry(q);
+      const answer = await askWithRetry(q);
       if (r.cancelled) return;
-      if (index === null) {
+      if (answer === null) {
         say("Couldn't get answer", '#f85149');
         return;
       }
-      const answerText = q.answers.find((a) => a.index === index)?.text || '?';
-      show(answerText);
+      show(kindOf(q).show(q, answer));
 
-      // The question often arrives before its buttons do.
+      // The question often arrives before its buttons do. On AhaSlides, it's read on the rules screen.
       say('Waiting for the answer buttons...', '#f0a500');
-      const button = await waitForButton(q, index, r);
+      const button = SITE === 'aha' ? await waitForAhaControls(q, answer, r) : await waitForButton(q, answer, r);
       if (r.cancelled) return;
       if (button < 0) {
         say("Couldn't find that answer on screen — answer above", '#f85149');
         return;
       }
 
-      r.pick = button;
+      r.pick = button ?? undefined; // AhaSlides has nothing to highlight but multiple choice
       syncMark();
-      const delay = answerDelay(q, q.source === 'dom' ? r.startedAt : Date.now());
+      const delay = answerDelay(q, SITE === 'aha' ? r.liveAt : q.source === 'dom' ? r.startedAt : Date.now());
       if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
       else say('Auto-answer is off — answer above');
       await sleep(delay);
@@ -1352,10 +1590,14 @@ ${lettered(q.groups)}`,
         return;
       }
 
-      const result = SITE === 'menti' ? await tapAnswer(button) : submitAnswer(index, button);
+      const result = SITE === 'menti' ? await tapAnswer(button)
+        : SITE === 'aha' ? await enterAhaAnswer(q, answer, r)
+        : submitAnswer(answer, button);
       if (r.cancelled) return;
       if (result === 'sent') say('✓ Answered (sent over WebSocket)', '#3fb950');
       else if (result === 'tapped') say('✓ Answered (tapped on the page)', '#3fb950');
+      else if (result === 'entered') say('✓ Answered (entered on the page)', '#3fb950');
+      else if (result === 'stuck') say("Couldn't enter all of it — answer above", '#f85149');
       else if (result === 'nosocket') say("Can't auto-answer: no open WebSocket (Kahoot may be on HTTP) — answer above", '#f85149');
       else say('Answer buttons were gone — answer above', '#f85149');
     } catch (e) {
