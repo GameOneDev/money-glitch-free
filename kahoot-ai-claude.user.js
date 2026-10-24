@@ -509,6 +509,114 @@
     return parts.join('').trim();
   }
 
+  // Every kind of question but multiple choice. A question with no kind is multiple choice: q.answers,
+  // answered with one of their numbers. The rest list their parts the same way, as { index, text }.
+  //   text:       nothing to pick from; the answer is typed.
+  //   order:      q.items, answered with their numbers first to last.
+  //   match:      q.items and q.matches, answered with a match for each item, each match used once.
+  //   categorise: q.items and q.groups, answered with a group for each item.
+  // Items are numbered and the things they go with lettered, so the two can't be mixed up.
+  const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const listed = (parts, label = (i) => i) => parts.map((p) => `${label(p.index)}: ${p.text}`).join('\n');
+  const lettered = (parts) => listed(parts, (i) => LETTERS[i]);
+  const PAIRS_HOW = 'Reply with ONLY one line per item, its number then its letter (for example 0: B). No explanation.';
+
+  // Each item's letter, as { item index: other index }, or null unless every item got one. Pairs can be
+  // written "0: B", "0 - B", "0 → B" and so on, and a later pair for the same item wins.
+  function readPairs(items, others, text, oneEach) {
+    const picks = {};
+    for (const [, n, letter] of text.matchAll(/\b(\d+)\s*[:.)=>\-–—→]*\s*([A-Z])\b/g)) {
+      const item = items.find((p) => p.index === Number(n));
+      const other = others.find((p) => p.index === LETTERS.indexOf(letter));
+      if (item && other) picks[item.index] = other.index;
+    }
+    const used = Object.values(picks);
+    if (used.length !== items.length) return null;
+    if (oneEach && new Set(used).size !== used.length) return null;
+    return picks;
+  }
+
+  // What to ask for each kind, how to read the reply (null when it holds no usable answer), and how to
+  // show the answer in the panel.
+  const KINDS = {
+    choice: {
+      ask: (q) => `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.
+
+Question: ${q.question}
+
+Answers:
+${listed(q.answers)}`,
+      // The last whole number that is one of the answers, so a "2007" in its words can't be mistaken for one.
+      read: (q, text) => {
+        const numbers = (text.match(/\b\d+\b/g) || []).map(Number).filter((n) => q.answers.some((a) => a.index === n));
+        return numbers.length ? numbers[numbers.length - 1] : null;
+      },
+      show: (q, index) => q.answers.find((a) => a.index === index)?.text || '?',
+    },
+    text: {
+      ask: (q) => `There are no answers to pick from: the answer is typed in, and checked against the expected one. Reply with ONLY the answer, as short as it can be put (usually a word, a name or a number). No explanation, no quotes, no full stop.
+
+Question: ${q.question}`,
+      // The last line, without quotes or bold around it, or a full stop after it.
+      read: (q, text) => {
+        const line = text.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
+        const answer = line.replace(/^["'“”‘’*_`]+|["'“”‘’*_`.]+$/g, '').trim();
+        return answer && answer.length <= 200 ? answer : null;
+      },
+      show: (q, answer) => answer,
+    },
+    order: {
+      ask: (q) => `Put these items in the correct order. Reply with ONLY their numbers in that order, first to last, separated by commas (for example 2, 0, 1). No explanation.
+
+Question: ${q.question}
+
+Items:
+${listed(q.items)}`,
+      // The last line that has every item's number once, so numbers in any words before it don't count.
+      read: (q, text) => {
+        for (const line of text.split('\n').reverse()) {
+          const order = [...new Set((line.match(/\b\d+\b/g) || []).map(Number))].filter((n) => q.items.some((p) => p.index === n));
+          if (order.length === q.items.length) return order;
+        }
+        return null;
+      },
+      show: (q, order) => order.map((i) => q.items.find((p) => p.index === i).text).join(' → '),
+    },
+    match: {
+      ask: (q) => `Match each numbered item with the lettered one it goes with. Each letter goes with one item. ${PAIRS_HOW}
+
+Question: ${q.question}
+
+Items:
+${listed(q.items)}
+
+Matches:
+${lettered(q.matches)}`,
+      read: (q, text) => readPairs(q.items, q.matches, text, true),
+      show: (q, picks) => q.items.map((p) => `${p.text} = ${q.matches.find((m) => m.index === picks[p.index]).text}`).join('; '),
+    },
+    categorise: {
+      ask: (q) => `Sort each numbered item into the lettered group it belongs in. ${PAIRS_HOW}
+
+Question: ${q.question}
+
+Items:
+${listed(q.items)}
+
+Groups:
+${lettered(q.groups)}`,
+      read: (q, text) => readPairs(q.items, q.groups, text, false),
+      show: (q, picks) => q.groups
+        .map((g) => [g, q.items.filter((p) => picks[p.index] === g.index)])
+        .filter(([, items]) => items.length)
+        .map(([g, items]) => `${g.text}: ${items.map((p) => p.text).join(', ')}`)
+        .join('; '),
+    },
+  };
+  const kindOf = (q) => KINDS[q.kind ?? 'choice'];
+
+  // Claude's answer: an answer's number for multiple choice, otherwise whatever that kind's read gives.
+  // Null when the reply has no usable answer.
   async function askClaude(data) {
     if (!apiKey) {
       const error = new Error('No API key — paste it in the panel');
@@ -517,14 +625,7 @@
     }
     const search = prefs.webSearch;
     let fast = prefs.fast && fastModel();
-    const answersText = data.answers.map((a) => `${a.index}: ${a.text}`).join('\n');
-    const validNumbers = data.answers.map((a) => a.index).join(', ');
-    const prompt = `You are answering a quiz question. ${search ? 'If you are not sure of the answer you may search the web, but answer straight away when you know it. ' : ''}Reply with ONLY the number of the correct answer (${validNumbers}). No explanation, no punctuation, just the number.
-
-Question: ${data.question}
-
-Answers:
-${answersText}`;
+    const prompt = `You are answering a quiz question. ${search ? 'If you are not sure of the answer you may search the web, but answer straight away when you know it. ' : ''}${kindOf(data).ask(data)}`;
 
     const body = {
       model: prefs.model,
@@ -564,10 +665,7 @@ ${answersText}`;
       if (json.stop_reason === 'pause_turn') throw new Error('Claude was still searching');
       return null;
     }
-
-    // The last whole number that is one of the answers, so a "2007" in its words can't be mistaken for one.
-    const numbers = (text.match(/\b\d+\b/g) || []).map(Number).filter((n) => data.answers.some((a) => a.index === n));
-    return numbers.length ? numbers[numbers.length - 1] : null;
+    return kindOf(data).read(data, text);
   }
 
   // One retry, since a single hiccup shouldn't cost the question. A bad key won't fix itself,
@@ -575,8 +673,8 @@ ${answersText}`;
   async function askWithRetry(data) {
     for (let attempt = 0; ; attempt++) {
       try {
-        const index = await askClaude(data);
-        if (index !== null || attempt >= 1) return index;
+        const answer = await askClaude(data);
+        if (answer !== null || attempt >= 1) return answer;
       } catch (e) {
         if (e.fatal || e.timeout || attempt >= 1) throw e;
       }
