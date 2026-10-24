@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.7
 // @description  Answers Kahoot questions with Claude. Auto-answers over Kahoot's WebSocket, with a choice of model, optional web search and fast mode, and an optional answer highlight. Reads questions from the WebSocket or HTTP long-polling traffic, and falls back to the page.
 // @match        https://kahoot.it/*
 // @grant        none
@@ -62,6 +62,7 @@
     webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
     model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id },
+    ui:         { key: "kahoot-ai-ui",          fallback: "compact" }, // compact | open | hidden
   };
   const prefs = {};
   for (const [name, { key, fallback }] of Object.entries(PREFS)) {
@@ -72,11 +73,13 @@
     } catch (_) {}
   }
   if (!MODELS.some((m) => m.id === prefs.model)) prefs.model = PREFS.model.fallback;
+  if (!["compact", "open", "hidden"].includes(prefs.ui)) prefs.ui = PREFS.ui.fallback;
 
   function setPref(name, value) {
     prefs[name] = value;
     try { localStorage.setItem(PREFS[name].key, typeof value === "boolean" ? (value ? "1" : "0") : value); } catch (_) {}
     renderControls();
+    renderUi();
     if (name === "highlight") syncMark();
     console.log(LOG, name, "=", value);
   }
@@ -475,16 +478,17 @@ ${answersText}`;
   }
 
   // ── ANSWER HIGHLIGHT ──────────────────────────────────────────
-  // A soft outline over the answer Claude picked. Drawn over the page, not in it, so Kahoot
-  // re-rendering can't remove it, and it follows the button until the question screen goes away.
+  // A soft outline over the answer Claude picked. Drawn over the page, not in it (in the panel's
+  // shadow root), so Kahoot re-rendering or restyling can't touch it, and it follows the button until
+  // the question screen goes away.
   let mark = null; // { chosen, el }
 
   function showMark(chosen) {
-    if (mark?.chosen === chosen) return;
+    if (mark?.chosen === chosen || !root) return;
     clearMark();
     const el = document.createElement('div');
-    el.className = 'kahoot-ai-ring';
-    document.body.appendChild(el);
+    el.className = 'ring';
+    root.appendChild(el);
     const own = mark = { chosen, el };
     requestAnimationFrame(() => placeMark(own));
   }
@@ -515,55 +519,151 @@ ${answersText}`;
   }
 
   // ── UI ────────────────────────────────────────────────────────
+  // The panel lives in a shadow root, so Kahoot's own styles can't reach in and restyle it (a page
+  // rule squeezing the key box is what that prevents), and nothing here leaks out to the page. It is
+  // made for a phone first: a one-line bar that keeps the answer in view with the settings folded
+  // away, big tap targets, and 16px text in the boxes (anything smaller makes iOS zoom in).
+  let root = null;
+  const $ = (id) => root?.getElementById(id) ?? null;
+
+  const SWITCHES = [
+    { name: 'autoAnswer', label: 'Auto-answer', hint: "Sends Claude's answer for you" },
+    { name: 'highlight', label: 'Highlight answer', hint: 'A soft outline on the pick' },
+    { name: 'webSearch', label: 'Web search', hint: 'Slower, and each search is billed' },
+    { name: 'fast', label: 'Fast mode', hint: 'Opus 5.5 only, at twice the price' },
+  ];
+
+  const PANEL_CSS = `
+    *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    [hidden] { display: none !important; }
+    button, input, select { font: inherit; color: inherit; margin: 0; }
+
+    .ring {
+      position: fixed; z-index: 1; pointer-events: none; border-radius: 12px;
+      border: 2px solid rgba(63, 185, 80, .45); background: rgba(63, 185, 80, .12);
+    }
+
+    .panel, .fab {
+      position: fixed; z-index: 2;
+      top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right));
+      font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #e2e8f0;
+    }
+    .panel {
+      width: min(360px, calc(100vw - 16px));
+      max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px);
+      display: flex; flex-direction: column; overflow: hidden;
+      background: #0f1117; border: 1px solid #30363d; border-radius: 14px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .6);
+    }
+    .fab {
+      width: 44px; height: 44px; border: 0; border-radius: 50%; padding: 0;
+      background: #58a6ff; color: #0f1117; font-size: 20px; font-weight: 700; cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+    }
+
+    .bar { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 6px 6px 6px 12px; }
+    .logo { flex: none; color: #58a6ff; font-size: 18px; }
+    .readout { flex: 1; min-width: 0; }
+    .status {
+      color: #8b949e; font-size: 12px; overflow: hidden; overflow-wrap: anywhere;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+    .answer { color: #3fb950; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .icon {
+      flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0;
+      border: 0; border-radius: 10px; background: transparent; color: #8b949e; font-size: 20px; cursor: pointer;
+    }
+    .icon:active, .icon[aria-expanded="true"] { background: #1c2330; color: #e2e8f0; }
+
+    .settings { overflow-y: auto; overscroll-behavior: contain; padding: 0 12px 8px; border-top: 1px solid #21262d; }
+    .field-head, .field-row, .row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px;
+    }
+    .field-head { min-height: 44px; padding-top: 4px; }
+    .key-tools { display: flex; align-items: center; }
+    .key-state { color: #f85149; font-size: 12px; }
+    .key-state.ok { color: #3fb950; }
+    .link { padding: 10px 8px; border: 0; background: none; color: #58a6ff; font-size: 13px; cursor: pointer; }
+    .editor { display: flex; gap: 8px; padding-bottom: 10px; }
+    input, select {
+      height: 44px; padding: 0 10px; border: 1px solid #30363d; border-radius: 8px;
+      background: #161b22; color: #e2e8f0; font-size: 16px;
+    }
+    input { flex: 1; min-width: 0; }
+    select { min-width: 0; max-width: 55%; }
+    .save {
+      flex: none; height: 44px; padding: 0 18px; border: 0; border-radius: 8px;
+      background: #238636; color: #fff; font-weight: 600; cursor: pointer;
+    }
+    .row {
+      width: 100%; padding: 6px 0; border: 0; border-top: 1px solid #21262d; background: none;
+      text-align: left; cursor: pointer;
+    }
+    .row .text { display: flex; flex-direction: column; min-width: 0; }
+    .row .hint { color: #8b949e; font-size: 12px; }
+    .track {
+      position: relative; flex: none; width: 48px; height: 28px; border-radius: 14px;
+      background: #30363d; transition: background .15s;
+    }
+    .track::after {
+      content: ''; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px;
+      border-radius: 50%; background: #e2e8f0; transition: transform .15s;
+    }
+    .row[aria-checked="true"] .track { background: #238636; }
+    .row[aria-checked="true"] .track::after { transform: translateX(20px); }
+    .row[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+  `;
+
   function setStatus(text, color) {
-    const el = document.getElementById('kahoot-status');
-    if (el) { el.textContent = text; el.style.color = color || '#8b949e'; }
+    const el = $('kahoot-status');
+    if (el) { el.textContent = text; el.style.color = color || ''; }
   }
 
   function setAnswer(text, color) {
-    const el = document.getElementById('kahoot-answer');
-    if (el) { el.textContent = text; el.style.color = color || '#3fb950'; }
+    const el = $('kahoot-answer');
+    if (el) { el.textContent = text; el.style.color = color || ''; }
   }
 
-  const SWITCHES = [
-    { name: 'autoAnswer', label: 'Auto-answer', title: "On: sends Claude's answer for you. Off: only shows it here." },
-    { name: 'highlight', label: 'Highlight answer', title: "Outlines the answer Claude picks on the page." },
-    { name: 'webSearch', label: 'Web search', title: "Lets Claude search the web when it isn't sure. Slower, and each search is billed." },
-    { name: 'fast', label: 'Fast mode', title: "Asks for faster output (speed: fast). Only on Opus 5.5, at twice the price." },
-  ];
+  // With no key the settings stay open, since there's nothing to do until one is pasted.
+  function uiState() {
+    if (prefs.ui === 'hidden') return 'hidden';
+    return !apiKey || prefs.ui === 'open' ? 'open' : 'compact';
+  }
+
+  function renderUi() {
+    if (!root) return;
+    const state = uiState();
+    $('kahoot-fab').hidden = state !== 'hidden';
+    $('kahoot-panel').hidden = state === 'hidden';
+    $('kahoot-settings').hidden = state !== 'open';
+    $('kahoot-toggle').setAttribute('aria-expanded', String(state === 'open'));
+  }
 
   function renderControls() {
     for (const { name } of SWITCHES) {
-      const sw = document.getElementById(`kahoot-sw-${name}`);
-      if (!sw) continue;
-      const on = prefs[name];
-      const disabled = name === 'fast' && !fastModel();
-      sw.setAttribute('aria-checked', String(on));
-      sw.setAttribute('aria-disabled', String(disabled));
-      sw.style.background = on ? '#238636' : '#30363d';
-      sw.style.opacity = disabled ? '.4' : '1';
-      sw.style.cursor = disabled ? 'not-allowed' : 'pointer';
-      sw.firstElementChild.style.left = on ? '18px' : '2px';
+      const row = $(`kahoot-sw-${name}`);
+      if (!row) continue;
+      row.setAttribute('aria-checked', String(prefs[name]));
+      row.setAttribute('aria-disabled', String(name === 'fast' && !fastModel()));
     }
-    const select = document.getElementById('kahoot-model');
+    const select = $('kahoot-model');
     if (select) select.value = prefs.model;
   }
 
   // The key row: when there's a key it shows just "saved" with change / remove, and the box to paste
   // one stays out of the way until asked for.
   function renderKey() {
-    const state = document.getElementById('kahoot-key-state');
+    const state = $('kahoot-key-state');
     if (!state) return;
     state.textContent = apiKey ? '✓ saved' : 'not set';
-    state.style.color = apiKey ? '#3fb950' : '#f85149';
-    for (const id of ['kahoot-key-change', 'kahoot-key-remove']) {
-      document.getElementById(id).style.display = apiKey ? '' : 'none';
-    }
-    document.getElementById('kahoot-key-editor').style.display = !apiKey || editingKey ? 'flex' : 'none';
+    state.classList.toggle('ok', !!apiKey);
+    $('kahoot-key-change').hidden = $('kahoot-key-remove').hidden = !apiKey;
+    $('kahoot-key-editor').hidden = !(!apiKey || editingKey);
+    renderUi();
   }
 
   function submitKey() {
-    const input = document.getElementById('kahoot-key');
+    const input = $('kahoot-key');
     const value = input.value.trim();
     if (!KEY_SHAPE.test(value)) {
       setStatus("That doesn't look like an Anthropic API key (sk-ant-…)", '#f85149');
@@ -574,130 +674,81 @@ ${answersText}`;
     setStatus('API key saved', '#3fb950');
   }
 
-  function injectStyles() {
-    const style = document.createElement('style');
-    style.textContent = `
-      .kahoot-ai-ring {
-        position: fixed; z-index: 999998; pointer-events: none; box-sizing: border-box; border-radius: 12px;
-        border: 2px solid rgba(63, 185, 80, .45); background: rgba(63, 185, 80, .12);
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
   function buildUI() {
-    injectStyles();
-    const reopenBtn = document.createElement('div');
-    reopenBtn.id = 'kahoot-reopen';
-    reopenBtn.style.cssText = `
-      position: fixed; top: 16px; right: 16px; z-index: 999999;
-      width: 32px; height: 32px; border-radius: 50%;
-      background: #58a6ff; color: #0f1117;
-      font-size: 18px; font-weight: 700;
-      display: none; align-items: center; justify-content: center;
-      cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    const host = document.createElement('div');
+    host.id = 'kahoot-ai-host';
+    host.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
+    root = host.attachShadow({ mode: 'closed' });
+    root.innerHTML = `
+      <style>${PANEL_CSS}</style>
+      <button id="kahoot-fab" class="fab" type="button" aria-label="Show Kahoot Helper" hidden>⚡</button>
+      <section id="kahoot-panel" class="panel" hidden>
+        <div class="bar">
+          <span class="logo">⚡</span>
+          <div class="readout">
+            <div id="kahoot-status" class="status">Waiting for question...</div>
+            <div id="kahoot-answer" class="answer">—</div>
+          </div>
+          <button id="kahoot-toggle" class="icon" type="button" aria-label="Settings" aria-expanded="false">⚙</button>
+          <button id="kahoot-close" class="icon" type="button" aria-label="Hide">×</button>
+        </div>
+        <div id="kahoot-settings" class="settings" hidden>
+          <div class="field-head">
+            <span>API key</span>
+            <span class="key-tools">
+              <span id="kahoot-key-state" class="key-state"></span>
+              <button id="kahoot-key-change" class="link" type="button">change</button>
+              <button id="kahoot-key-remove" class="link" type="button">remove</button>
+            </span>
+          </div>
+          <div id="kahoot-key-editor" class="editor">
+            <input id="kahoot-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">
+            <button id="kahoot-key-save" class="save" type="button">Save</button>
+          </div>
+          <label class="field-row">
+            <span>Model</span>
+            <select id="kahoot-model">${MODELS.map((m) => `<option value="${m.id}">${m.name}</option>`).join('')}</select>
+          </label>
+          ${SWITCHES.map(({ name, label, hint }) => `
+            <button id="kahoot-sw-${name}" class="row" type="button" role="switch" aria-label="${label}">
+              <span class="text"><span>${label}</span><span class="hint">${hint}</span></span>
+              <span class="track"></span>
+            </button>`).join('')}
+        </div>
+      </section>
     `;
-    reopenBtn.textContent = '⚡';
-    document.body.appendChild(reopenBtn);
-
-    const panel = document.createElement('div');
-    panel.id = 'kahoot-ai-panel';
-    panel.style.cssText = `
-      position: fixed; top: 16px; right: 16px; z-index: 999999;
-      background: #0f1117; color: #e2e8f0;
-      border: 1px solid #30363d; border-radius: 12px;
-      padding: 16px 20px; font-family: 'Fira Code', monospace;
-      font-size: 13px; min-width: 240px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-    `;
-    const row = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
-    const link = 'background:none;border:none;color:#58a6ff;cursor:pointer;font:inherit;font-size:11px;padding:0 0 0 6px;';
-    panel.innerHTML = `
-      <div style="${row}margin-bottom:14px;">
-        <span style="font-size:14px;font-weight:700;color:#58a6ff;">⚡ Kahoot Helper</span>
-        <button id="kahoot-close" style="
-          background:none;border:none;color:#8b949e;
-          cursor:pointer;font-size:18px;padding:0;line-height:1;">×</button>
-      </div>
-      <div style="${row}margin-bottom:6px;">
-        <span style="font-size:12px;">API key</span>
-        <span>
-          <span id="kahoot-key-state" style="font-size:11px;"></span>
-          <button id="kahoot-key-change" type="button" style="${link}">change</button>
-          <button id="kahoot-key-remove" type="button" style="${link}">remove</button>
-        </span>
-      </div>
-      <div id="kahoot-key-editor" style="display:flex;gap:6px;margin-bottom:10px;">
-        <input id="kahoot-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-..."
-          style="flex:1;min-width:0;background:#161b22;color:#e2e8f0;border:1px solid #30363d;
-          border-radius:6px;padding:4px 6px;font:inherit;font-size:12px;">
-        <button id="kahoot-key-save" type="button" style="background:#238636;color:#fff;border:none;
-          border-radius:6px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;">Save</button>
-      </div>
-      <div style="${row}">
-        <span style="font-size:12px;">Model</span>
-        <select id="kahoot-model" style="background:#161b22;color:#e2e8f0;border:1px solid #30363d;
-          border-radius:6px;padding:3px 6px;font:inherit;font-size:12px;">
-          ${MODELS.map((m) => `<option value="${m.id}">${m.name}</option>`).join('')}
-        </select>
-      </div>
-      ${SWITCHES.map(({ name, label, title }) => `
-        <div style="${row}" title="${title}">
-          <span style="font-size:12px;">${label}</span>
-          <button id="kahoot-sw-${name}" type="button" role="switch" aria-label="${label}"
-            style="position:relative;width:36px;height:20px;border:none;border-radius:10px;
-            padding:0;transition:background .15s;">
-            <span style="position:absolute;top:2px;left:2px;width:16px;height:16px;
-              border-radius:50%;background:#e2e8f0;transition:left .15s;"></span>
-          </button>
-        </div>`).join('')}
-      <div style="font-size:10px;color:#8b949e;text-transform:uppercase;
-        letter-spacing:0.08em;margin:14px 0 4px;">Status</div>
-      <div id="kahoot-status" style="font-size:12px;color:#8b949e;margin-bottom:12px;">
-        Waiting for question...
-      </div>
-      <div style="font-size:10px;color:#8b949e;text-transform:uppercase;
-        letter-spacing:0.08em;margin-bottom:4px;">Answer</div>
-      <div id="kahoot-answer" style="
-        font-size:18px;font-weight:700;color:#3fb950;
-        min-height:26px;letter-spacing:0.02em;">—</div>
-    `;
-    document.body.appendChild(panel);
+    document.body.appendChild(host);
 
     for (const { name } of SWITCHES) {
-      document.getElementById(`kahoot-sw-${name}`).addEventListener('click', (e) => {
+      $(`kahoot-sw-${name}`).addEventListener('click', (e) => {
         if (e.currentTarget.getAttribute('aria-disabled') === 'true') return;
         setPref(name, !prefs[name]);
       });
     }
-    document.getElementById('kahoot-model').addEventListener('change', (e) => setPref('model', e.target.value));
-    renderControls();
+    $('kahoot-model').addEventListener('change', (e) => setPref('model', e.target.value));
 
-    const keyInput = document.getElementById('kahoot-key');
+    const keyInput = $('kahoot-key');
     // Keep Kahoot's own keyboard handling away from what's typed here.
     for (const type of ['keydown', 'keyup', 'keypress']) keyInput.addEventListener(type, (e) => e.stopPropagation());
     keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitKey(); });
-    document.getElementById('kahoot-key-save').addEventListener('click', submitKey);
-    document.getElementById('kahoot-key-change').addEventListener('click', () => {
+    $('kahoot-key-save').addEventListener('click', submitKey);
+    $('kahoot-key-change').addEventListener('click', () => {
       editingKey = !editingKey;
       renderKey();
       if (editingKey) keyInput.focus();
     });
-    document.getElementById('kahoot-key-remove').addEventListener('click', () => {
+    $('kahoot-key-remove').addEventListener('click', () => {
       saveApiKey('');
       setStatus('API key removed');
     });
+
+    // Settings fold open from the bar, and the whole panel folds away to a small ⚡ button.
+    $('kahoot-toggle').addEventListener('click', () => setPref('ui', uiState() === 'open' ? 'compact' : 'open'));
+    $('kahoot-close').addEventListener('click', () => setPref('ui', 'hidden'));
+    $('kahoot-fab').addEventListener('click', () => setPref('ui', 'compact'));
+
+    renderControls();
     renderKey();
-
-    document.getElementById('kahoot-close').addEventListener('click', () => {
-      panel.style.display = 'none';
-      reopenBtn.style.display = 'flex';
-    });
-
-    reopenBtn.addEventListener('click', () => {
-      panel.style.display = '';
-      reopenBtn.style.display = 'none';
-    });
   }
 
   // ── ROUNDS ────────────────────────────────────────────────────
