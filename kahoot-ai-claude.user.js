@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  Answers Kahoot questions with Claude. Auto-answers over Kahoot's WebSocket, with a choice of model, optional web search and fast mode, and an optional answer highlight. Reads questions from the WebSocket or HTTP long-polling traffic, and falls back to the page.
+// @version      4.0
+// @description  Answers Kahoot and Mentimeter (menti.com) quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer. A choice of model, optional web search and fast mode, and an optional answer highlight.
 // @match        https://kahoot.it/*
+// @match        https://www.menti.com/*
+// @match        https://menti.com/*
 // @grant        none
 // @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/GameOneDev/money-glitch-free/main/kahoot-ai-claude.user.js
@@ -55,7 +57,10 @@
   // arriving this soon after, is that and not a new question.
   const REPEAT_WINDOW_MS = 10000;
 
-  const LOG = "[Kahoot AI]";
+  // Which game this page is. Most of the script is the same for both; the parts that read the question
+  // and send the answer differ.
+  const SITE = /(^|\.)menti\.com$/.test(location.hostname) ? "menti" : "kahoot";
+  const LOG = SITE === "menti" ? "[Menti AI]" : "[Kahoot AI]";
   const API_URL = "https://api.anthropic.com/v1/messages";
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -209,33 +214,99 @@
     }
   }
 
-  const isCometdUrl = url => String(url ?? "").includes("/cometd/");
+  // ── READ QUESTIONS FROM MENTIMETER'S TRAFFIC ──────────────────
+  // menti.com's voting page loads the whole presentation as JSON: every question, with its type and
+  // its choices, and under "pace" which one is up. Its socket says when that changes. Keep every
+  // question seen; the one being asked is whichever has its choices on screen (see READ THE PAGE).
+  // Polls, word clouds, scales and the like have no right answer, so only quiz questions are answered.
+  const MENTI_QUIZ_TYPE = /^quiz/;
+  const MENTI_TYPED_ANSWER = /open|type/;
+  const mentiQuestions = new Map(); // id -> { ids, question, answers, type, seen }
+  let mentiActive = null;           // pace.active: the id of the question that's up, when it's known
 
-  // HTTP long-polling: XMLHttpRequest, which is what CometD uses, and fetch in case that changes.
+  // Walk any JSON the page gets. Socket messages can carry their JSON as a string inside JSON, or after
+  // a numeric frame prefix ("42[...]"), so strings that look like JSON are opened up too.
+  function handleMentiData(node, depth = 0, parentKey = "") {
+    if (node == null || depth > 12) return;
+    if (typeof node === "string") {
+      const text = node.trim().replace(/^\d+(?=[[{])/, "");
+      if ((text[0] === "{" || text[0] === "[") && text.length < 2e6) {
+        try { handleMentiData(JSON.parse(text), depth + 1); } catch (_) {}
+      }
+      return;
+    }
+    if (typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const value of node) handleMentiData(value, depth + 1);
+      return;
+    }
+    if (parentKey === "pace" && node.active != null && String(node.active) !== mentiActive) {
+      mentiActive = String(node.active);
+      if (prefs.trace) console.log(LOG, "Active question:", mentiActive);
+    }
+    learnMentiQuestion(node);
+    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key);
+  }
+
+  function learnMentiQuestion(node) {
+    const title = [node.question, node.title, node.heading].find((t) => typeof t === "string" && t.trim());
+    const list = [node.choices, node.options].find(Array.isArray);
+    if (!title || !list || list.length < 2) return;
+    const answers = list.map((c, index) => ({
+      index,
+      text: cleanText(typeof c === "string" ? c : c?.label ?? c?.title ?? c?.text ?? "")
+    }));
+    if (answers.some((a) => !a.text)) return;
+    const question = cleanText(title);
+    const ids = [node.id, node.public_key, node.publicKey, node.admin_key].filter((v) => v != null && v !== "").map(String);
+    const id = ids[0] ?? textKey(question);
+    const known = mentiQuestions.get(id);
+    mentiQuestions.set(id, { ids, question, answers, type: String(node.type ?? ""), seen: ++seq });
+    if (!known && prefs.trace) console.log(LOG, `Learned ${node.type ?? "a"} question:`, question, answers.map((a) => a.text));
+  }
+
+  const isCometdUrl = url => String(url ?? "").includes("/cometd/");
+  function isMentiUrl(url) {
+    try {
+      const { hostname, pathname } = new URL(String(url ?? ""), location.href);
+      return /(^|\.)(menti|mentimeter)\.com$/.test(hostname) && !/\.(js|css|png|jpe?g|gif|svg|webp|woff2?|ico)$/i.test(pathname);
+    } catch (_) { return false; }
+  }
+  const isWatchedUrl = (url) => (SITE === "menti" ? isMentiUrl(url) : isCometdUrl(url));
+
+  // Kahoot's traffic is always JSON. Mentimeter's is anything, and its reader takes text as it comes.
+  function onWire(payload, source) {
+    if (SITE === "menti") handleMentiData(payload);
+    else handleKahootMessages(typeof payload === "string" ? JSON.parse(payload) : payload, source);
+  }
+
+  // HTTP: XMLHttpRequest, which is what CometD uses, and fetch in case that changes. Mentimeter's
+  // page fetches its JSON.
   const OldXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
-    if (isCometdUrl(url) && !this.__kahootAiHooked) {
+    if (isWatchedUrl(url) && !this.__kahootAiHooked) {
       this.__kahootAiHooked = true;
-      this.addEventListener("load", onCometdXhrLoad);
+      this.addEventListener("load", onWatchedXhrLoad);
     }
     return OldXhrOpen.apply(this, arguments);
   };
 
-  function onCometdXhrLoad() {
-    if (this.status < 200 || this.status >= 300 || !isCometdUrl(this.responseURL)) return;
+  function onWatchedXhrLoad() {
+    if (this.status < 200 || this.status >= 300 || !isWatchedUrl(this.responseURL)) return;
+    if (SITE === "menti" && !/json/i.test(this.getResponseHeader("content-type") ?? "")) return;
     try {
-      if (this.responseType === "json") handleKahootMessages(this.response, "http");
-      else if (this.responseType === "" || this.responseType === "text") handleKahootMessages(JSON.parse(this.responseText), "http");
+      if (this.responseType === "json") onWire(this.response, "http");
+      else if (this.responseType === "" || this.responseType === "text") onWire(this.responseText, "http");
     } catch (e) { console.debug(LOG, "XHR parse error:", e.message); }
   }
 
   const OldFetch = window.fetch;
   window.fetch = function (input) {
     const request = OldFetch.apply(this, arguments);
-    if (isCometdUrl(typeof input === "string" ? input : input?.url)) {
+    if (isWatchedUrl(typeof input === "string" ? input : input?.url)) {
       request
-        .then(resp => resp.clone().text())
-        .then(text => handleKahootMessages(JSON.parse(text), "http"))
+        .then(resp => (SITE === "menti" && !/json/i.test(resp.headers.get("content-type") ?? "") ? null : resp.clone().text()))
+        .then(text => { if (text !== null) onWire(text, "http"); })
         .catch(e => console.debug(LOG, "fetch parse error:", e.message));
     }
     return request;
@@ -245,12 +316,14 @@
   const OldWebSocket = window.WebSocket;
   window.WebSocket = function (url, protocols) {
     const ws = protocols ? new OldWebSocket(url, protocols) : new OldWebSocket(url);
-    activeWs = ws;
     ws.addEventListener("message", event => {
       try {
-        if (typeof event.data === "string") handleKahootMessages(JSON.parse(event.data), "ws");
+        if (typeof event.data === "string") onWire(event.data, "ws");
       } catch (e) { console.debug(LOG, "WS parse error:", e.message); }
     });
+    // Answers go over the socket only on Kahoot. Mentimeter's is only listened to.
+    if (SITE === "menti") return ws;
+    activeWs = ws;
 
     // Watch what Kahoot's own client sends: that's where the client id and message numbers come from,
     // and where an answer's exact shape can be read off when you answer one yourself.
@@ -284,10 +357,92 @@
   });
 
   // ── READ THE PAGE ─────────────────────────────────────────────
-  const buttonFor = (index) => document.querySelector(`[data-functional-selector="answer-${index}"]`);
-  const choiceTextEl = (index) => document.querySelector(`[data-functional-selector="question-choice-text-${index}"]`);
+  // The answer buttons on screen, by position. Kahoot marks them; Mentimeter's are found by their text.
+  const buttonFor = (index) => SITE === "menti"
+    ? mentiScreen().els[index] ?? null
+    : document.querySelector(`[data-functional-selector="answer-${index}"]`);
+  const choiceTextEl = (index) => SITE === "menti"
+    ? mentiScreen().els[index] ?? null
+    : document.querySelector(`[data-functional-selector="question-choice-text-${index}"]`);
+  const isDisabled = (el) => !!el.disabled || el.getAttribute("aria-disabled") === "true";
+  const isVisible = (el) => el.getClientRects().length > 0;
+
+  // Mentimeter's class names are generated and change, so there's nothing to select its answers by.
+  // Instead, take each question learned from the traffic and look for its choices among the things on
+  // screen that can be tapped. The question whose choices are all there is the one being asked.
+  const TAPPABLE = 'button, [role="button"], [role="radio"], [role="option"], [role="checkbox"], label';
+  let screenCache = { at: 0, q: null, els: [] };
+
+  function mentiScreen() {
+    if (Date.now() - screenCache.at < 50 && screenCache.els.every((el) => el.isConnected)) return screenCache;
+    screenCache = { at: Date.now(), ...scanMentiScreen() };
+    return screenCache;
+  }
+
+  // A choice can be shown with a letter or number in front of it ("A Paris").
+  const choiceMatches = (shown, want) => shown === want || (shown.endsWith(want) && shown.length - want.length <= 2);
+
+  function scanMentiScreen() {
+    let pool = [...document.querySelectorAll(TAPPABLE)]
+      .filter(isVisible)
+      .map((el) => ({ el, key: textKey(el.textContent) }))
+      .filter((c) => c.key);
+    // A button inside a label with the same text: take the button.
+    pool = pool.filter((c) => !pool.some((o) => o !== c && o.key === c.key && c.el.contains(o.el)));
+
+    const found = [];
+    for (const q of mentiQuestions.values()) {
+      const els = [];
+      for (const a of q.answers) {
+        const want = textKey(a.text);
+        const hit = pool.find((c) => !els.includes(c.el) && choiceMatches(c.key, want));
+        if (!hit) break;
+        els.push(hit.el);
+      }
+      if (els.length === q.answers.length) found.push({ q, els });
+    }
+    if (found.length) {
+      // Two questions can share their choices (true / false). Prefer the one whose text is on screen,
+      // then the one the traffic says is up, then the newest.
+      if (found.length > 1) {
+        const pageKey = textKey(document.body?.textContent);
+        const score = ({ q }) => (pageKey.includes(textKey(q.question)) ? 4 : 0) + (q.ids.includes(mentiActive) ? 2 : 0);
+        found.sort((a, b) => score(b) - score(a) || b.q.seen - a.q.seen);
+      }
+      const { q, els } = found[0];
+      return { q, els: els.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)) };
+    }
+    return scanMentiFallback();
+  }
+
+  // Nothing learned from the traffic matches. Take a set of radio buttons and the heading above them.
+  function scanMentiFallback() {
+    const none = { q: null, els: [] };
+    let els = [...document.querySelectorAll('[role="radio"]')].filter(isVisible);
+    if (els.length < 2) {
+      els = [...document.querySelectorAll('input[type="radio"]')]
+        .map((input) => input.labels?.[0] ?? input.closest("label"))
+        .filter((el) => el && isVisible(el));
+    }
+    els = [...new Set(els)];
+    if (els.length < 2 || els.some((el) => !cleanText(el.textContent))) return none;
+    const heading = [...document.querySelectorAll("h1, h2, h3, legend")].find((h) => isVisible(h) && cleanText(h.textContent));
+    if (!heading) return none;
+    const answers = els.map((el, index) => ({ index, text: cleanText(el.textContent) }));
+    return { q: { ids: [], question: cleanText(heading.textContent), answers, type: "", seen: 0 }, els };
+  }
+
+  function mentiQuestionOnScreen() {
+    const { q } = mentiScreen();
+    if (!q) return null;
+    if (q.type && (!MENTI_QUIZ_TYPE.test(q.type) || MENTI_TYPED_ANSWER.test(q.type))) {
+      return { unsupported: q.type, question: q.question, answers: [] };
+    }
+    return { question: q.question, answers: q.answers };
+  }
 
   function getQuestionDataFromDom() {
+    if (SITE === "menti") return mentiQuestionOnScreen();
     const question = document.querySelector('[data-functional-selector="block-title"]')?.textContent?.trim();
     if (!question) return null;
 
@@ -458,7 +613,7 @@ ${answersText}`;
       found = locateButton(q, index);
       if (found >= 0) {
         r.sawButtons = true;
-        const disabled = buttonFor(found).disabled;
+        const disabled = isDisabled(buttonFor(found));
         if (!reported) {
           reported = true;
           console.log(LOG, `Answer button ${found} is on screen (${disabled ? 'disabled' : 'enabled'}) after ${Date.now() - startedWaiting}ms`);
@@ -493,6 +648,36 @@ ${answersText}`;
     activeWs.send(JSON.stringify(packet));
     console.log(LOG, `Answer ${index} sent over the WebSocket (question ${questionIndex}, ${wireIndex === null ? 'counted' : 'from Kahoot'})`);
     return 'sent';
+  }
+
+  // Mentimeter: tap the answer like a player would. Some screens take the answer with that tap, others
+  // pick it and want a Submit button pressed after, so press that too when one shows up.
+  // Returns 'tapped', or 'missed' (the question screen was already gone).
+  const SUBMIT_TEXT = /^(submit|send|vote|answer|skicka|rösta|svara|absenden|senden|abstimmen|envoyer|valider|voter|enviar|votar|invia|vota|verzenden|stemmen|wyślij|odeslat|lähetä|send inn|indsend)\b/i;
+
+  function findSubmit(choice) {
+    const choices = mentiScreen().els;
+    const inForm = choice.closest('form')?.querySelector('button[type="submit"], input[type="submit"]');
+    if (inForm && isVisible(inForm)) return inForm;
+    return [...document.querySelectorAll('button, [role="button"]')]
+      .find((el) => isVisible(el) && !choices.some((c) => c === el || c.contains(el) || el.contains(c)) && SUBMIT_TEXT.test(cleanText(el.textContent)));
+  }
+
+  async function tapAnswer(button) {
+    const el = buttonFor(button);
+    if (!el) return 'missed';
+    el.click();
+    console.log(LOG, `Tapped answer ${button}:`, cleanText(el.textContent));
+    for (const deadline = Date.now() + 1500; Date.now() < deadline; await sleep(100)) {
+      if (!el.isConnected) break; // the screen moved on: the tap was the answer
+      const submit = findSubmit(el);
+      if (submit && !isDisabled(submit)) {
+        submit.click();
+        console.log(LOG, 'Pressed', JSON.stringify(cleanText(submit.textContent)));
+        break;
+      }
+    }
+    return 'tapped';
   }
 
   // ── ANSWER HIGHLIGHT ──────────────────────────────────────────
@@ -570,7 +755,7 @@ ${answersText}`;
     { name: 'searchTimeout', label: 'Timeout with search', hint: 'Searching takes longer', unit: 's', scale: 1000, step: 1 },
   ];
   const ADVANCED_SWITCHES = [
-    { name: 'trace', label: 'Debug log', hint: "Prints Kahoot's messages in the browser console" },
+    { name: 'trace', label: 'Debug log', hint: "Prints the game's messages in the browser console" },
   ];
   let advancedOpen = false;
 
@@ -831,7 +1016,7 @@ ${answersText}`;
     root = host.attachShadow({ mode: 'closed' });
     root.innerHTML = `
       <style>${PANEL_CSS}</style>
-      <button id="kahoot-fab" class="fab" type="button" aria-label="Show Kahoot Helper" hidden>⚡</button>
+      <button id="kahoot-fab" class="fab" type="button" aria-label="Show quiz helper" hidden>⚡</button>
       <section id="kahoot-panel" class="panel" hidden>
         <div class="bar">
           <span class="logo">⚡</span>
@@ -1050,8 +1235,10 @@ ${answersText}`;
         return;
       }
 
-      const result = submitAnswer(index, button);
+      const result = SITE === 'menti' ? await tapAnswer(button) : submitAnswer(index, button);
+      if (r.cancelled) return;
       if (result === 'sent') say('✓ Answered (sent over WebSocket)', '#3fb950');
+      else if (result === 'tapped') say('✓ Answered (tapped on the page)', '#3fb950');
       else if (result === 'nosocket') say("Can't auto-answer: no open WebSocket (Kahoot may be on HTTP) — answer above", '#f85149');
       else say('Answer buttons were gone — answer above', '#f85149');
     } catch (e) {
