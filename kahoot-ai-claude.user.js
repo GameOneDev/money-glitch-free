@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      3.7
+// @version      3.9
 // @description  Answers Kahoot questions with Claude. Auto-answers over Kahoot's WebSocket, with a choice of model, optional web search and fast mode, and an optional answer highlight. Reads questions from the WebSocket or HTTP long-polling traffic, and falls back to the page.
 // @match        https://kahoot.it/*
 // @grant        none
@@ -26,29 +26,34 @@
   // Fast mode (speed: "fast") is a research preview that only some models have, at twice the price.
   const FAST_MODELS = new Set(["claude-opus-5-5"]);
   const FAST_BETA = "fast-mode-2026-02-01";
-  // Claude 5.x models think before they answer, and that thinking counts toward max_tokens.
-  // So keep the effort low and leave room for it. Use null for models without the effort setting.
+  // These seven are where the panel's Advanced section starts. Change them there: it remembers.
+  // How long Claude thinks before it answers: low, medium or high.
   const EFFORT = "low";
-  const MAX_TOKENS = 1024;
-  // With web search the model also writes its queries, so give it more room, and more time.
-  const MAX_TOKENS_SEARCH = 4096;
+  // Web searches Claude may run per question.
   const MAX_SEARCHES = 2;
-  const MAX_CONTINUATIONS = 3;
+  // How long to wait for Claude, and for Claude with web search, before giving up.
   const API_TIMEOUT_MS = 20000;
   const SEARCH_TIMEOUT_MS = 40000;
-  // A pause before sending the answer, so it isn't instant. Set both to 0 for the fastest answers.
+  // A random pause before sending the answer, so it isn't instant. Both at 0 answers at once.
   const ANSWER_DELAY_MIN = 150;
   const ANSWER_DELAY_MAX = 700;
   // Never wait so long that less than this much of the question's timer is left to answer in.
   const TIMER_MARGIN_MS = 2500;
+  // Print Kahoot's game messages (both directions) in the console, for working out why an answer
+  // isn't taken.
+  const TRACE = false;
+
+  // Not in the panel.
+  // Claude 5.x models think before they answer, and that thinking counts toward max_tokens, so the
+  // longer it's allowed to think the more room it needs. With web search it also writes its queries.
+  const TOKENS_BY_EFFORT = { low: 1024, medium: 4096, high: 8192 };
+  const SEARCH_EXTRA_TOKENS = 3072;
+  const MAX_CONTINUATIONS = 3;
   // How long to wait for the answer buttons to show up and become clickable.
   const BUTTON_WAIT_MS = 30000;
   // CometD can redeliver a message after a reconnect. A question matching the one that just finished,
   // arriving this soon after, is that and not a new question.
   const REPEAT_WINDOW_MS = 10000;
-  // Print Kahoot's game messages (both directions) in the console, for working out why an answer
-  // isn't taken.
-  const TRACE = false;
 
   const LOG = "[Kahoot AI]";
   const API_URL = "https://api.anthropic.com/v1/messages";
@@ -61,19 +66,32 @@
     highlight:  { key: "kahoot-ai-highlight",   fallback: true },   // outline the answer on screen
     webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
-    model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id },
-    ui:         { key: "kahoot-ai-ui",          fallback: "compact" }, // compact | open | hidden
+    model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id, options: MODELS.map((m) => m.id) },
+    ui:         { key: "kahoot-ai-ui",          fallback: "compact", options: ["compact", "open", "hidden"] },
+    // The Advanced section. Times are kept in milliseconds, and the panel shows seconds.
+    delayMin:      { key: "kahoot-ai-delay-min",      fallback: ANSWER_DELAY_MIN,  min: 0,     max: 30000 },
+    delayMax:      { key: "kahoot-ai-delay-max",      fallback: ANSWER_DELAY_MAX,  min: 0,     max: 30000 },
+    margin:        { key: "kahoot-ai-margin",         fallback: TIMER_MARGIN_MS,   min: 0,     max: 30000 },
+    effort:        { key: "kahoot-ai-effort",         fallback: EFFORT,            options: Object.keys(TOKENS_BY_EFFORT) },
+    maxSearches:   { key: "kahoot-ai-max-searches",   fallback: MAX_SEARCHES,      min: 1,     max: 10 },
+    timeout:       { key: "kahoot-ai-timeout",        fallback: API_TIMEOUT_MS,    min: 5000,  max: 120000 },
+    searchTimeout: { key: "kahoot-ai-search-timeout", fallback: SEARCH_TIMEOUT_MS, min: 10000, max: 180000 },
+    trace:         { key: "kahoot-ai-trace",          fallback: TRACE },
   };
   const prefs = {};
-  for (const [name, { key, fallback }] of Object.entries(PREFS)) {
-    prefs[name] = fallback;
+  for (const [name, { key, fallback, min, max, options }] of Object.entries(PREFS)) {
+    let value = fallback;
     try {
       const saved = localStorage.getItem(key);
-      if (saved !== null) prefs[name] = typeof fallback === "boolean" ? saved === "1" : saved;
+      if (saved !== null) value = typeof fallback === "boolean" ? saved === "1" : typeof fallback === "number" ? Number(saved) : saved;
     } catch (_) {}
+    // Anything saved that this version doesn't know (a model that's gone, a number out of range) goes
+    // back to the default. A NaN fails the range check too.
+    if (options && !options.includes(value)) value = fallback;
+    if (typeof fallback === "number" && !(value >= min && value <= max)) value = fallback;
+    prefs[name] = value;
   }
-  if (!MODELS.some((m) => m.id === prefs.model)) prefs.model = PREFS.model.fallback;
-  if (!["compact", "open", "hidden"].includes(prefs.ui)) prefs.ui = PREFS.ui.fallback;
+  if (prefs.delayMin > prefs.delayMax) prefs.delayMax = prefs.delayMin;
 
   function setPref(name, value) {
     prefs[name] = value;
@@ -153,7 +171,7 @@
   }
 
   function trace(arrow, item) {
-    if (!TRACE || !item?.channel || item.channel.startsWith("/meta/")) return;
+    if (!prefs.trace || !item?.channel || item.channel.startsWith("/meta/")) return;
     console.log(LOG, arrow, item.channel, `data.id=${item.data?.id}`, String(item.data?.content ?? "").slice(0, 300));
   }
 
@@ -353,12 +371,12 @@ ${answersText}`;
 
     const body = {
       model: prefs.model,
-      max_tokens: search ? MAX_TOKENS_SEARCH : MAX_TOKENS,
+      max_tokens: TOKENS_BY_EFFORT[prefs.effort] + (search ? SEARCH_EXTRA_TOKENS : 0),
       messages: [{ role: 'user', content: prompt }],
+      output_config: { effort: prefs.effort },
     };
-    if (EFFORT) body.output_config = { effort: EFFORT };
-    if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: MAX_SEARCHES }];
-    const timeoutMs = search ? SEARCH_TIMEOUT_MS : API_TIMEOUT_MS;
+    if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: prefs.maxSearches }];
+    const timeoutMs = search ? prefs.searchTimeout : prefs.timeout;
 
     let json;
     for (let step = 0; ; step++) {
@@ -526,12 +544,35 @@ ${answersText}`;
   let root = null;
   const $ = (id) => root?.getElementById(id) ?? null;
 
+  // Kahoot's top bar has a badge ("Quiz") on the question screens. That's the panel's button while it's
+  // there; the ⚡ button is for everywhere else, like the lobby. Kahoot's class names are generated, so
+  // find it by the label's data attribute, and take the label's parent, which holds the icon as well.
+  const BADGE_LABEL = '[data-functional-selector^="question-type-heading"]';
+  const findBadge = () => document.querySelector(BADGE_LABEL)?.parentElement ?? null;
+  let badge = null;
+
   const SWITCHES = [
     { name: 'autoAnswer', label: 'Auto-answer', hint: "Sends Claude's answer for you" },
     { name: 'highlight', label: 'Highlight answer', hint: 'A soft outline on the pick' },
     { name: 'webSearch', label: 'Web search', hint: 'Slower, and each search is billed' },
     { name: 'fast', label: 'Fast mode', hint: 'Opus 5.5 only, at twice the price' },
   ];
+
+  // The Advanced section, folded away until asked for. `scale` turns the saved value into what's shown
+  // (milliseconds into seconds). A field with options in PREFS is a menu, the rest are numbers.
+  const ADVANCED = [
+    { name: 'delayMin', label: 'Answer delay, shortest', hint: 'Wait at least this long before answering', unit: 's', scale: 1000, step: 0.05 },
+    { name: 'delayMax', label: 'Answer delay, longest', hint: 'A random wait up to this. Both at 0 answers at once', unit: 's', scale: 1000, step: 0.05 },
+    { name: 'margin', label: 'Timer margin', hint: "Always leave this much of the question's timer", unit: 's', scale: 1000, step: 0.5 },
+    { name: 'effort', label: 'Thinking effort', hint: 'Higher is slower, and better on hard questions' },
+    { name: 'maxSearches', label: 'Web searches', hint: 'The most it may run per question', unit: '', scale: 1, step: 1 },
+    { name: 'timeout', label: 'Request timeout', hint: 'Give up on Claude after this long', unit: 's', scale: 1000, step: 1 },
+    { name: 'searchTimeout', label: 'Timeout with search', hint: 'Searching takes longer', unit: 's', scale: 1000, step: 1 },
+  ];
+  const ADVANCED_SWITCHES = [
+    { name: 'trace', label: 'Debug log', hint: "Prints Kahoot's messages in the browser console" },
+  ];
+  let advancedOpen = false;
 
   const PANEL_CSS = `
     *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -599,8 +640,21 @@ ${answersText}`;
       width: 100%; padding: 6px 0; border: 0; border-top: 1px solid #21262d; background: none;
       text-align: left; cursor: pointer;
     }
-    .row .text { display: flex; flex-direction: column; min-width: 0; }
-    .row .hint { color: #8b949e; font-size: 12px; }
+    .text { display: flex; flex-direction: column; min-width: 0; }
+    .hint { color: #8b949e; font-size: 12px; }
+    .row-field {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      min-height: 52px; padding: 6px 0; border-top: 1px solid #21262d;
+    }
+    .row-field select { flex: none; width: 112px; max-width: none; }
+    .num-wrap { display: flex; align-items: center; gap: 6px; flex: none; }
+    .num { flex: none; width: 88px; text-align: right; }
+    .unit { min-width: 8px; color: #8b949e; font-size: 13px; }
+    .chev { flex: none; color: #8b949e; font-size: 16px; }
+    .reset {
+      width: 100%; height: 44px; margin: 8px 0 4px; border: 1px solid #30363d; border-radius: 8px;
+      background: none; color: #8b949e; cursor: pointer;
+    }
     .track {
       position: relative; flex: none; width: 48px; height: 28px; border-radius: 14px;
       background: #30363d; transition: background .15s;
@@ -633,14 +687,53 @@ ${answersText}`;
   function renderUi() {
     if (!root) return;
     const state = uiState();
-    $('kahoot-fab').hidden = state !== 'hidden';
+    $('kahoot-fab').hidden = state !== 'hidden' || !!badge;
     $('kahoot-panel').hidden = state === 'hidden';
     $('kahoot-settings').hidden = state !== 'open';
     $('kahoot-toggle').setAttribute('aria-expanded', String(state === 'open'));
+    styleBadge();
+    placePanel(); // so it opens where it belongs, not a tick later
   }
 
+  // The badge looks tappable, and lit while the panel is up.
+  function styleBadge() {
+    if (!badge) return;
+    badge.style.cursor = 'pointer';
+    badge.style.outline = uiState() === 'hidden' ? '' : '2px solid rgba(88, 166, 255, .75)';
+    badge.style.outlineOffset = '2px';
+  }
+
+  // Keep the panel just under the badge, so it never covers the button that closes it.
+  function placePanel() {
+    const panel = $('kahoot-panel');
+    if (!panel) return;
+    if (!badge) {
+      panel.style.top = panel.style.maxHeight = '';
+      return;
+    }
+    const top = Math.max(8, Math.round(badge.getBoundingClientRect().bottom) + 8);
+    panel.style.top = `${top}px`;
+    panel.style.maxHeight = `calc(100vh - ${top + 8}px)`;
+    panel.style.maxHeight = `calc(100dvh - ${top + 8}px)`; // ignored where dvh isn't known
+  }
+
+  // Kahoot re-renders its top bar between screens, so look again each time round rather than hold on
+  // to one element.
+  function syncLauncher() {
+    if (!root) return;
+    const found = findBadge();
+    if (found !== badge) {
+      if (badge) badge.style.cursor = badge.style.outline = badge.style.outlineOffset = '';
+      badge = found;
+      renderUi();
+    }
+    placePanel();
+  }
+
+  const shown = (n) => String(Math.round(n * 100) / 100);
+
   function renderControls() {
-    for (const { name } of SWITCHES) {
+    for (const { name } of [...SWITCHES, ...ADVANCED_SWITCHES]) {
       const row = $(`kahoot-sw-${name}`);
       if (!row) continue;
       row.setAttribute('aria-checked', String(prefs[name]));
@@ -648,6 +741,42 @@ ${answersText}`;
     }
     const select = $('kahoot-model');
     if (select) select.value = prefs.model;
+    for (const { name, scale } of ADVANCED) {
+      const field = $(`kahoot-adv-${name}`);
+      // Not while it's being typed in.
+      if (field && root.activeElement !== field) field.value = PREFS[name].options ? prefs[name] : shown(prefs[name] / scale);
+    }
+  }
+
+  function renderAdvanced() {
+    $('kahoot-advanced').hidden = !advancedOpen;
+    $('kahoot-adv-chev').textContent = advancedOpen ? '▾' : '▸';
+    $('kahoot-adv-toggle').setAttribute('aria-expanded', String(advancedOpen));
+  }
+
+  // A number typed into the Advanced section: keep it if it's in range, otherwise say what's allowed and
+  // put the old one back.
+  function commitNumber(spec, input) {
+    const { min, max } = PREFS[spec.name];
+    const typed = parseFloat(input.value);
+    const value = Math.round(typed * spec.scale);
+    if (!Number.isFinite(typed) || value < min || value > max) {
+      setStatus(`${spec.label}: use ${min / spec.scale} to ${max / spec.scale}${spec.unit ? ' ' + spec.unit : ''}`, '#f85149');
+      renderControls();
+      return;
+    }
+    setPref(spec.name, value);
+    let note = `${spec.label}: ${shown(value / spec.scale)}${spec.unit ? ' ' + spec.unit : ''}`;
+    // The shortest wait can't be longer than the longest.
+    if (spec.name === 'delayMin' && value > prefs.delayMax) {
+      setPref('delayMax', value);
+      note += ' (longest raised to match)';
+    }
+    if (spec.name === 'delayMax' && value < prefs.delayMin) {
+      setPref('delayMin', value);
+      note += ' (shortest lowered to match)';
+    }
+    setStatus(note);
   }
 
   // The key row: when there's a key it shows just "saved" with change / remove, and the box to paste
@@ -673,6 +802,27 @@ ${answersText}`;
     saveApiKey(value);
     setStatus('API key saved', '#3fb950');
   }
+
+  const switchRow = ({ name, label, hint }) => `
+    <button id="kahoot-sw-${name}" class="row" type="button" role="switch" aria-label="${label}">
+      <span class="text"><span>${label}</span><span class="hint">${hint}</span></span>
+      <span class="track"></span>
+    </button>`;
+
+  const fieldRow = ({ name, label, hint, unit, scale, step }) => {
+    const { min, max, options } = PREFS[name];
+    const control = options
+      ? `<select id="kahoot-adv-${name}">${options.map((o) => `<option value="${o}">${o[0].toUpperCase() + o.slice(1)}</option>`).join('')}</select>`
+      : `<span class="num-wrap">
+          <input id="kahoot-adv-${name}" class="num" type="number" inputmode="decimal" step="${step}" min="${min / scale}" max="${max / scale}">
+          <span class="unit">${unit}</span>
+        </span>`;
+    return `
+      <label class="row-field">
+        <span class="text"><span>${label}</span><span class="hint">${hint}</span></span>
+        ${control}
+      </label>`;
+  };
 
   function buildUI() {
     const host = document.createElement('div');
@@ -709,17 +859,22 @@ ${answersText}`;
             <span>Model</span>
             <select id="kahoot-model">${MODELS.map((m) => `<option value="${m.id}">${m.name}</option>`).join('')}</select>
           </label>
-          ${SWITCHES.map(({ name, label, hint }) => `
-            <button id="kahoot-sw-${name}" class="row" type="button" role="switch" aria-label="${label}">
-              <span class="text"><span>${label}</span><span class="hint">${hint}</span></span>
-              <span class="track"></span>
-            </button>`).join('')}
+          ${SWITCHES.map(switchRow).join('')}
+          <button id="kahoot-adv-toggle" class="row" type="button" aria-expanded="false">
+            <span class="text"><span>Advanced</span><span class="hint">Delays, thinking, timeouts, debug</span></span>
+            <span id="kahoot-adv-chev" class="chev">▸</span>
+          </button>
+          <div id="kahoot-advanced" hidden>
+            ${ADVANCED.map(fieldRow).join('')}
+            ${ADVANCED_SWITCHES.map(switchRow).join('')}
+            <button id="kahoot-adv-reset" class="reset" type="button">Reset advanced to defaults</button>
+          </div>
         </div>
       </section>
     `;
     document.body.appendChild(host);
 
-    for (const { name } of SWITCHES) {
+    for (const { name } of [...SWITCHES, ...ADVANCED_SWITCHES]) {
       $(`kahoot-sw-${name}`).addEventListener('click', (e) => {
         if (e.currentTarget.getAttribute('aria-disabled') === 'true') return;
         setPref(name, !prefs[name]);
@@ -727,9 +882,24 @@ ${answersText}`;
     }
     $('kahoot-model').addEventListener('change', (e) => setPref('model', e.target.value));
 
+    for (const spec of ADVANCED) {
+      const field = $(`kahoot-adv-${spec.name}`);
+      field.addEventListener('change', () => (PREFS[spec.name].options ? setPref(spec.name, field.value) : commitNumber(spec, field)));
+      field.addEventListener('keydown', (e) => { if (e.key === 'Enter') field.blur(); });
+    }
+    $('kahoot-adv-toggle').addEventListener('click', () => {
+      advancedOpen = !advancedOpen;
+      renderAdvanced();
+      if (advancedOpen) $('kahoot-advanced').scrollIntoView?.({ block: 'nearest' });
+    });
+    $('kahoot-adv-reset').addEventListener('click', () => {
+      for (const { name } of [...ADVANCED, ...ADVANCED_SWITCHES]) setPref(name, PREFS[name].fallback);
+      setStatus('Advanced settings reset');
+    });
+
+    // Keep Kahoot's own keyboard handling away from what's typed in the panel.
+    for (const type of ['keydown', 'keyup', 'keypress']) root.addEventListener(type, (e) => e.stopPropagation());
     const keyInput = $('kahoot-key');
-    // Keep Kahoot's own keyboard handling away from what's typed here.
-    for (const type of ['keydown', 'keyup', 'keypress']) keyInput.addEventListener(type, (e) => e.stopPropagation());
     keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitKey(); });
     $('kahoot-key-save').addEventListener('click', submitKey);
     $('kahoot-key-change').addEventListener('click', () => {
@@ -747,8 +917,20 @@ ${answersText}`;
     $('kahoot-close').addEventListener('click', () => setPref('ui', 'hidden'));
     $('kahoot-fab').addEventListener('click', () => setPref('ui', 'compact'));
 
+    // A tap on the badge shows or hides the panel. Caught at the document, before Kahoot sees it, so it
+    // keeps working however many times Kahoot swaps the badge for a new one.
+    document.addEventListener('click', (e) => {
+      const target = findBadge();
+      if (!target || !target.contains(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setPref('ui', uiState() === 'hidden' ? 'compact' : 'hidden');
+    }, true);
+
     renderControls();
+    renderAdvanced();
     renderKey();
+    syncLauncher();
   }
 
   // ── ROUNDS ────────────────────────────────────────────────────
@@ -817,9 +999,9 @@ ${answersText}`;
 
   // Wait this long before answering, so it isn't instant, but never so long that the timer runs out.
   function answerDelay(q, since) {
-    const wanted = ANSWER_DELAY_MIN + Math.random() * (ANSWER_DELAY_MAX - ANSWER_DELAY_MIN);
+    const wanted = prefs.delayMin + Math.random() * (prefs.delayMax - prefs.delayMin);
     if (!q.time) return wanted;
-    return Math.max(0, Math.min(wanted, q.time - TIMER_MARGIN_MS - (Date.now() - since)));
+    return Math.max(0, Math.min(wanted, q.time - prefs.margin - (Date.now() - since)));
   }
 
   async function handleQuestion(q, r) {
@@ -857,7 +1039,7 @@ ${answersText}`;
       r.pick = button;
       syncMark();
       const delay = answerDelay(q, q.source === 'dom' ? r.startedAt : Date.now());
-      if (prefs.autoAnswer) say(`Answering in ${Math.round(delay / 1000)}s...`, '#f0a500');
+      if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
       else say('Auto-answer is off — answer above');
       await sleep(delay);
       if (r.cancelled) return;
@@ -879,6 +1061,7 @@ ${answersText}`;
 
   function loop() {
     try {
+      syncLauncher();
       trackRound();
       const q = pendingQuestion();
       if (q) startRound(q);
