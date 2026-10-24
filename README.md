@@ -4,4 +4,6 @@ Tamper Monkey: [install](https://raw.githubusercontent.com/GameOneDev/money-glit
 
 Works on Kahoot (kahoot.it), Mentimeter quizzes (menti.com, multiple-choice quiz questions; polls are left alone) and AhaSlides quizzes (audience.ahaslides.com). The API key is saved per site, so paste it once on each.
 
+On Menti the whole quiz is known when the voting page loads, so Claude answers every quiz question in the background while you wait, and each answer is ready when its question comes up. The "Answer ahead" switch in the panel turns that off (it costs one request per question).
+
 On AhaSlides it answers multiple choice (including questions with several right answers), short answer, correct order, match pairs and categorise slides, live or self-paced. Pictures on the question, the answers or the matches go to Claude along with the text.

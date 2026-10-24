@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      4.6
-// @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise, and sends the slide's pictures along. A choice of model, optional web search and fast mode, and an optional answer highlight.
+// @version      4.7
+// @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic, answers the whole quiz ahead of time and taps the answer when its question comes up; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise, and sends the slide's pictures along. A choice of model, optional web search and fast mode, and an optional answer highlight.
 // @match        https://kahoot.it/*
 // @match        https://www.menti.com/*
 // @match        https://menti.com/*
