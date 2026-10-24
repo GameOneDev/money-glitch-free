@@ -76,6 +76,7 @@
     highlight:  { key: "kahoot-ai-highlight",   fallback: true },   // outline the answer on screen
     webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
+    prefetch:   { key: "kahoot-ai-prefetch",    fallback: true },   // Menti: answer the whole quiz before it starts
     model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id, options: MODELS.map((m) => m.id) },
     // "hidden" folds the panel to the ⚡ button; "off" makes that button invisible, though a tap on it
     // still works.
@@ -111,6 +112,7 @@
     renderControls();
     renderUi();
     if (name === "highlight") syncMark();
+    if (["model", "effort", "webSearch", "fast", "maxSearches", "prefetch"].includes(name)) schedulePrefetch();
     console.log(LOG, name, "=", value);
   }
 
@@ -129,6 +131,8 @@
   function saveApiKey(value) {
     apiKey = value;
     editingKey = false;
+    prefetchHalted = false;
+    schedulePrefetch();
     try {
       if (value) localStorage.setItem(KEY_STORAGE, value);
       else localStorage.removeItem(KEY_STORAGE);
@@ -239,7 +243,9 @@
     if (node == null || depth > 12) return;
     if (typeof node === "string") {
       const text = node.trim().replace(/^\d+(?=[[{])/, "");
-      if ((text[0] === "{" || text[0] === "[") && text.length < 2e6) {
+      // Most of what the page receives (stats, vote counts, tracking) holds no question, so only
+      // something that names choices or the pace is opened up.
+      if ((text[0] === "{" || text[0] === "[") && text.length < 2e6 && /choices|options|pace/.test(text)) {
         try { handleMentiData(JSON.parse(text), depth + 1); } catch (_) {}
       }
       return;
@@ -275,6 +281,7 @@
     const known = mentiQuestions.get(id);
     mentiQuestions.set(id, { ids, question, answers, type, seen: ++seq });
     if (!known && prefs.trace) console.log(LOG, `Learned ${type || "a"} question:`, question, answers.map((a) => a.text));
+    schedulePrefetch();
   }
 
   const isCometdUrl = url => String(url ?? "").includes("/cometd/");
@@ -385,10 +392,20 @@
   // Instead, take each question learned from the traffic and look for its choices among the things on
   // screen that can be tapped. The question whose choices are all there is the one being asked.
   const TAPPABLE = 'button, [role="button"], [role="radio"], [role="option"], [role="checkbox"], label';
+  // An answer is a few words. Anything with far more text than that is a container, not a choice.
+  const CHOICE_TEXT_MAX = 400;
+  // The page's own markup changes all the time (a ticking timer, live results), and scanning it is the
+  // costly part, so a scan is kept for as long as nothing changed, and never run more than ten times a
+  // second. A watcher on the page (see START) sets screenDirty.
+  const SCAN_MIN_GAP_MS = 100;
+  const SCAN_MAX_AGE_MS = 1000;
+  let screenDirty = true;
   let screenCache = { at: 0, q: null, els: [] };
 
   function mentiScreen() {
-    if (Date.now() - screenCache.at < 50 && screenCache.els.every((el) => el.isConnected)) return screenCache;
+    const age = Date.now() - screenCache.at;
+    if ((age < SCAN_MIN_GAP_MS || (!screenDirty && age < SCAN_MAX_AGE_MS)) && screenCache.els.every((el) => el.isConnected)) return screenCache;
+    screenDirty = false;
     screenCache = { at: Date.now(), ...scanMentiScreen() };
     return screenCache;
   }
@@ -396,9 +413,28 @@
   // A choice can be shown with a letter or number in front of it ("A Paris").
   const choiceMatches = (shown, want) => shown === want || (shown.endsWith(want) && shown.length - want.length <= 2);
 
+  // The element on screen for each answer, in the answers' order (so els[i] is answer i, however the page
+  // lays them out), or null unless every answer has one. Exact text first, then text with a letter or
+  // number in front, longest answers first so that "5" can't take the element that says "A 25". An
+  // element is used once.
+  function matchChoices(answers, pool) {
+    const els = answers.map(() => null);
+    const taken = new Set();
+    const wants = answers.map((a) => textKey(a.text));
+    const longestFirst = wants.map((_, i) => i).sort((a, b) => wants[b].length - wants[a].length);
+    for (const exact of [true, false]) {
+      for (const i of longestFirst) {
+        if (els[i]) continue;
+        const hit = pool.find((c) => !taken.has(c.el) && (exact ? c.key === wants[i] : choiceMatches(c.key, wants[i])));
+        if (hit) { els[i] = hit.el; taken.add(hit.el); }
+      }
+    }
+    return els.every(Boolean) ? els : null;
+  }
+
   function scanMentiScreen() {
     let pool = [...document.querySelectorAll(TAPPABLE)]
-      .filter(isVisible)
+      .filter((el) => isVisible(el) && el.textContent.length <= CHOICE_TEXT_MAX)
       .map((el) => ({ el, key: textKey(el.textContent) }))
       .filter((c) => c.key);
     // A button inside a label with the same text: take the button.
@@ -406,14 +442,8 @@
 
     const found = [];
     for (const q of mentiQuestions.values()) {
-      const els = [];
-      for (const a of q.answers) {
-        const want = textKey(a.text);
-        const hit = pool.find((c) => !els.includes(c.el) && choiceMatches(c.key, want));
-        if (!hit) break;
-        els.push(hit.el);
-      }
-      if (els.length === q.answers.length) found.push({ q, els });
+      const els = matchChoices(q.answers, pool);
+      if (els) found.push({ q, els });
     }
     if (found.length) {
       // Two questions can share their choices (true / false). Prefer the one whose text is on screen,
@@ -423,8 +453,7 @@
         const score = ({ q }) => (pageKey.includes(textKey(q.question)) ? 4 : 0) + (q.ids.includes(mentiActive) ? 2 : 0);
         found.sort((a, b) => score(b) - score(a) || b.q.seen - a.q.seen);
       }
-      const { q, els } = found[0];
-      return { q, els: els.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)) };
+      return found[0];
     }
     return scanMentiFallback();
   }
@@ -842,11 +871,85 @@ ${lettered(q.groups)}`,
     }
   }
 
+  // ── ANSWER AHEAD ──────────────────────────────────────────────
+  // Menti hands over the whole quiz when it loads, so Claude can work through the questions while the
+  // players are still waiting, and each answer is there by the time its question comes up. That takes
+  // Claude's thinking out of the time the question is on screen. Answers are kept by question, choices
+  // and settings, so changing the model asks again.
+  const PREFETCH_PARALLEL = 2;
+  const PREFETCH_MAX = 60;
+  const answerCache = new Map(); // key -> { promise, done }
+  let prefetching = 0;
+  let prefetchTimer = 0;
+  let prefetchHalted = false; // the key was refused: stop until there's a new one
+
+  const cacheKey = (q) => [
+    prefs.model, prefs.effort, prefs.webSearch && prefs.maxSearches, prefs.fast && fastModel(),
+    textKey(q.question), q.answers.map((a) => textKey(a.text)).join("|"),
+  ].join("/");
+
+  // Asks once per question and settings, whether the question is up already or still to come.
+  function askCached(q) {
+    const key = cacheKey(q);
+    let entry = answerCache.get(key);
+    if (!entry) {
+      entry = { done: false, promise: askWithRetry(q) };
+      answerCache.set(key, entry);
+      // An answer that didn't come isn't kept: it's asked again when the question is up.
+      entry.promise.then((answer) => { if (answer === null) answerCache.delete(key); else entry.done = true; }, () => answerCache.delete(key));
+    }
+    return entry;
+  }
+
+  // Only the questions known to be quiz questions with choices; a poll has no right answer, and a
+  // question of unknown type is left until it's on screen.
+  const prefetchable = (q) => MENTI_QUIZ_TYPE.test(q.type) && !MENTI_TYPED_ANSWER.test(q.type);
+
+  function schedulePrefetch() {
+    if (SITE !== "menti" || prefetchTimer) return;
+    prefetchTimer = setTimeout(() => { prefetchTimer = 0; pumpPrefetch(); }, 50);
+  }
+
+  // Keeps a couple of questions going at a time, the one that's up first.
+  function pumpPrefetch() {
+    if (SITE !== "menti" || !prefs.prefetch || !apiKey || prefetchHalted) return;
+    const queue = [...mentiQuestions.values()].filter(prefetchable)
+      .sort((a, b) => Number(b.ids.includes(mentiActive)) - Number(a.ids.includes(mentiActive)));
+    for (const q of queue) {
+      if (prefetching >= PREFETCH_PARALLEL || answerCache.size >= PREFETCH_MAX) break;
+      const data = { question: q.question, answers: q.answers, source: "wire" };
+      if (answerCache.has(cacheKey(data))) continue;
+      prefetching++;
+      const started = Date.now();
+      // Only a finished answer starts the next one, so a failing connection can't loop.
+      askCached(data).promise.then(
+        (answer) => {
+          prefetching--;
+          if (answer === null) return;
+          console.log(LOG, `Asked ahead (${((Date.now() - started) / 1000).toFixed(1)}s):`, q.question, "→", kindOf(data).show(data, answer));
+          pumpPrefetch();
+        },
+        (e) => {
+          prefetching--;
+          if (e.fatal) prefetchHalted = true;
+          console.debug(LOG, "Couldn't ask ahead:", e.message);
+        }
+      );
+    }
+  }
+
   // ── FIND THE ANSWER BUTTON ────────────────────────────────────
   // Which button holds this answer? Kahoot can shuffle the buttons for a player, so go by the text on
   // the page when it's there, else by position. -1 when the buttons aren't there yet, or when the page
   // shows other answers (an older question's screen).
   function locateButton(q, index) {
+    if (SITE === "menti") {
+      // The buttons are already matched to the answers, in order, so only check the page still shows
+      // this question's answers.
+      const { q: shown, els } = mentiScreen();
+      const same = shown && shown.answers.length === q.answers.length && shown.answers.every((a, i) => textKey(a.text) === textKey(q.answers[i].text));
+      return same && els[index] ? index : -1;
+    }
     const text = q.answers.find((a) => a.index === index)?.text;
     let choicesShown = false;
     if (text) {
@@ -1153,6 +1256,7 @@ ${lettered(q.groups)}`,
     { name: 'highlight', label: 'Highlight answer', hint: 'A soft outline on the pick' },
     { name: 'webSearch', label: 'Web search', hint: 'Slower, and each search is billed' },
     { name: 'fast', label: 'Fast mode', hint: 'Opus 5.5 only, at twice the price' },
+    { name: 'prefetch', label: 'Answer ahead', hint: 'Menti: asks the whole quiz before it starts' },
   ];
 
   // The Advanced section, folded away until asked for. `scale` turns the saved value into what's shown
@@ -1862,10 +1966,12 @@ ${lettered(q.groups)}`,
         return;
       }
 
-      say(`Asking ${modelName(prefs.model)}${prefs.webSearch ? ' + web' : ''}... (${q.source})`, '#f0a500');
+      // On Menti the answer may be there already (see ANSWER AHEAD), or on its way.
+      const ahead = SITE === 'menti' ? askCached(q) : null;
+      say(ahead?.done ? 'Answer ready (asked ahead)' : `Asking ${modelName(prefs.model)}${prefs.webSearch ? ' + web' : ''}... (${q.source})`, '#f0a500');
       show('—');
 
-      const answer = await askWithRetry(q);
+      const answer = ahead ? await ahead.promise : await askWithRetry(q);
       if (r.cancelled) return;
       if (answer === null) {
         say("Couldn't get answer", '#f85149');
@@ -1924,7 +2030,15 @@ ${lettered(q.groups)}`,
     setTimeout(loop, 300);
   }
 
+  // Menti's page is rebuilt for each question. Note when it changes, so the screen is only scanned again
+  // then (see mentiScreen), not on every tick while the page sits still.
+  function watchPage() {
+    new MutationObserver(() => { screenDirty = true; })
+      .observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true });
+  }
+
   function start() {
+    if (SITE === 'menti') watchPage();
     buildUI();
     loop();
   }
