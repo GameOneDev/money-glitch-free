@@ -225,6 +225,8 @@
   // its choices, and under "pace" which one is up. Its socket says when that changes. Keep every
   // question seen; the one being asked is whichever has its choices on screen (see READ THE PAGE).
   // Polls, word clouds, scales and the like have no right answer, so only quiz questions are answered.
+  // In the current format each slide's type ("quiz-choice", "multiple-choice", ...) is on the slide, in
+  // static_content, and its title and choices are a level down, in interactive_contents.
   const MENTI_QUIZ_TYPE = /^quiz/;
   const MENTI_TYPED_ANSWER = /open|type/;
   const mentiQuestions = new Map(); // id -> { ids, question, answers, type, seen }
@@ -232,7 +234,7 @@
 
   // Walk any JSON the page gets. Socket messages can carry their JSON as a string inside JSON, or after
   // a numeric frame prefix ("42[...]"), so strings that look like JSON are opened up too.
-  function handleMentiData(node, depth = 0, parentKey = "") {
+  function handleMentiData(node, depth = 0, parentKey = "", slideType = "") {
     if (node == null || depth > 12) return;
     if (typeof node === "string") {
       const text = node.trim().replace(/^\d+(?=[[{])/, "");
@@ -243,18 +245,19 @@
     }
     if (typeof node !== "object") return;
     if (Array.isArray(node)) {
-      for (const value of node) handleMentiData(value, depth + 1);
+      for (const value of node) handleMentiData(value, depth + 1, "", slideType);
       return;
     }
     if (parentKey === "pace" && node.active != null && String(node.active) !== mentiActive) {
       mentiActive = String(node.active);
       if (prefs.trace) console.log(LOG, "Active question:", mentiActive);
     }
-    learnMentiQuestion(node);
-    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key);
+    slideType = node.static_content?.type ?? node.staticContent?.type ?? slideType;
+    learnMentiQuestion(node, slideType);
+    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key, slideType);
   }
 
-  function learnMentiQuestion(node) {
+  function learnMentiQuestion(node, slideType) {
     const title = [node.question, node.title, node.heading].find((t) => typeof t === "string" && t.trim());
     const list = [node.choices, node.options].find(Array.isArray);
     if (!title || !list || list.length < 2) return;
@@ -264,11 +267,13 @@
     }));
     if (answers.some((a) => !a.text)) return;
     const question = cleanText(title);
-    const ids = [node.id, node.public_key, node.publicKey, node.admin_key].filter((v) => v != null && v !== "").map(String);
+    const ids = [node.id, node.public_key, node.publicKey, node.admin_key, node.interactive_content_id, node.interactiveContentId]
+      .filter((v) => v != null && v !== "").map(String);
     const id = ids[0] ?? textKey(question);
+    const type = String(node.type ?? slideType ?? "");
     const known = mentiQuestions.get(id);
-    mentiQuestions.set(id, { ids, question, answers, type: String(node.type ?? ""), seen: ++seq });
-    if (!known && prefs.trace) console.log(LOG, `Learned ${node.type ?? "a"} question:`, question, answers.map((a) => a.text));
+    mentiQuestions.set(id, { ids, question, answers, type, seen: ++seq });
+    if (!known && prefs.trace) console.log(LOG, `Learned ${type || "a"} question:`, question, answers.map((a) => a.text));
   }
 
   const isCometdUrl = url => String(url ?? "").includes("/cometd/");
