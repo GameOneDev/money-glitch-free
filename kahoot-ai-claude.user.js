@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      3.9
+// @version      3.10
 // @description  Answers Kahoot questions with Claude. Auto-answers over Kahoot's WebSocket, with a choice of model, optional web search and fast mode, and an optional answer highlight. Reads questions from the WebSocket or HTTP long-polling traffic, and falls back to the page.
 // @match        https://kahoot.it/*
 // @grant        none
@@ -67,7 +67,8 @@
     webSearch:  { key: "kahoot-ai-web-search",  fallback: false },  // let Claude search the web
     fast:       { key: "kahoot-ai-fast",        fallback: false },  // speed: "fast"
     model:      { key: "kahoot-ai-model",       fallback: MODELS[0].id, options: MODELS.map((m) => m.id) },
-    ui:         { key: "kahoot-ai-ui",          fallback: "compact", options: ["compact", "open", "hidden"] },
+    // "hidden" folds the panel to the ⚡ button; "off" hides that too, until Alt+K or a tap on the badge.
+    ui:         { key: "kahoot-ai-ui",          fallback: "compact", options: ["compact", "open", "hidden", "off"] },
     // The Advanced section. Times are kept in milliseconds, and the panel shows seconds.
     delayMin:      { key: "kahoot-ai-delay-min",      fallback: ANSWER_DELAY_MIN,  min: 0,     max: 30000 },
     delayMax:      { key: "kahoot-ai-delay-max",      fallback: ANSWER_DELAY_MAX,  min: 0,     max: 30000 },
@@ -597,9 +598,8 @@ ${answersText}`;
       box-shadow: 0 8px 32px rgba(0, 0, 0, .6);
     }
     .fab {
-      width: 44px; height: 44px; border: 0; border-radius: 50%; padding: 0;
-      background: #58a6ff; color: #0f1117; font-size: 20px; font-weight: 700; cursor: pointer;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+      width: 44px; height: 44px; border: 1px solid rgba(88, 166, 255, .35); border-radius: 50%; padding: 0;
+      background: rgba(88, 166, 255, .15); color: rgba(88, 166, 255, .8); font-size: 20px; font-weight: 700; cursor: pointer;
     }
 
     .bar { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 6px 6px 6px 12px; }
@@ -680,26 +680,29 @@ ${answersText}`;
 
   // With no key the settings stay open, since there's nothing to do until one is pasted.
   function uiState() {
-    if (prefs.ui === 'hidden') return 'hidden';
+    if (prefs.ui === 'hidden' || prefs.ui === 'off') return prefs.ui;
     return !apiKey || prefs.ui === 'open' ? 'open' : 'compact';
   }
+
+  const panelShown = () => uiState() === 'compact' || uiState() === 'open';
 
   function renderUi() {
     if (!root) return;
     const state = uiState();
     $('kahoot-fab').hidden = state !== 'hidden' || !!badge;
-    $('kahoot-panel').hidden = state === 'hidden';
+    $('kahoot-panel').hidden = !panelShown();
     $('kahoot-settings').hidden = state !== 'open';
     $('kahoot-toggle').setAttribute('aria-expanded', String(state === 'open'));
     styleBadge();
     placePanel(); // so it opens where it belongs, not a tick later
   }
 
-  // The badge looks tappable, and lit while the panel is up.
+  // The badge looks tappable, and lit while the panel is up. Hidden completely, it looks untouched (a
+  // tap still brings the panel back).
   function styleBadge() {
     if (!badge) return;
-    badge.style.cursor = 'pointer';
-    badge.style.outline = uiState() === 'hidden' ? '' : '2px solid rgba(88, 166, 255, .75)';
+    badge.style.cursor = uiState() === 'off' ? '' : 'pointer';
+    badge.style.outline = panelShown() ? '2px solid rgba(88, 166, 255, .75)' : '';
     badge.style.outlineOffset = '2px';
   }
 
@@ -840,6 +843,8 @@ ${answersText}`;
             <div id="kahoot-answer" class="answer">—</div>
           </div>
           <button id="kahoot-toggle" class="icon" type="button" aria-label="Settings" aria-expanded="false">⚙</button>
+          <button id="kahoot-off" class="icon" type="button" aria-label="Hide completely"
+            title="Hide completely. Alt+K, or a tap on the Quiz badge, brings it back">⊘</button>
           <button id="kahoot-close" class="icon" type="button" aria-label="Hide">×</button>
         </div>
         <div id="kahoot-settings" class="settings" hidden>
@@ -912,10 +917,21 @@ ${answersText}`;
       setStatus('API key removed');
     });
 
-    // Settings fold open from the bar, and the whole panel folds away to a small ⚡ button.
+    // Settings fold open from the bar, and the whole panel folds away to a small ⚡ button, or out of
+    // sight altogether.
     $('kahoot-toggle').addEventListener('click', () => setPref('ui', uiState() === 'open' ? 'compact' : 'open'));
+    $('kahoot-off').addEventListener('click', () => setPref('ui', 'off'));
     $('kahoot-close').addEventListener('click', () => setPref('ui', 'hidden'));
     $('kahoot-fab').addEventListener('click', () => setPref('ui', 'compact'));
+
+    // Alt+K hides everything, or brings the panel back. Matched by key position, since Alt+K types a
+    // letter on a Mac.
+    document.addEventListener('keydown', (e) => {
+      if (e.code !== 'KeyK' || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setPref('ui', uiState() === 'off' ? 'compact' : 'off');
+    }, true);
 
     // A tap on the badge shows or hides the panel. Caught at the document, before Kahoot sees it, so it
     // keeps working however many times Kahoot swaps the badge for a new one.
@@ -924,7 +940,7 @@ ${answersText}`;
       if (!target || !target.contains(e.target)) return;
       e.preventDefault();
       e.stopPropagation();
-      setPref('ui', uiState() === 'hidden' ? 'compact' : 'hidden');
+      setPref('ui', panelShown() ? 'hidden' : 'compact');
     }, true);
 
     renderControls();
