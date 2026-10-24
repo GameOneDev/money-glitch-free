@@ -1205,7 +1205,14 @@ ${lettered(q.groups)}`,
       color: #8b949e; font-size: 12px; overflow: hidden; overflow-wrap: anywhere;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     }
-    .answer { color: #3fb950; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .answer-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .answer { min-width: 0; color: #3fb950; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .picks { display: flex; flex: none; gap: 4px; }
+    .picks:empty { display: none; }
+    .pick {
+      display: grid; place-items: center; min-width: 26px; height: 26px; padding: 0 6px; border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, .25); background: #30363d; color: #e2e8f0; font-size: 15px; font-weight: 800;
+    }
     .icon {
       flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0;
       border: 0; border-radius: 10px; background: transparent; color: #8b949e; font-size: 20px; cursor: pointer;
@@ -1269,9 +1276,44 @@ ${lettered(q.groups)}`,
     if (el) { el.textContent = text; el.style.color = color || ''; }
   }
 
+  // A new answer clears the badges, which belong to the one it replaces.
   function setAnswer(text, color) {
     const el = $('kahoot-answer');
     if (el) { el.textContent = text; el.style.color = color || ''; }
+    setPicks([]);
+  }
+
+  // A badge for each picked answer button, with its number on screen in its color, so it can be found
+  // at a glance (a Kahoot player's phone shows only the colors).
+  function setPicks(positions) {
+    const box = $('kahoot-picks');
+    if (!box) return;
+    box.replaceChildren(...positions.map((position) => {
+      const badge = document.createElement('span');
+      badge.className = 'pick';
+      badge.textContent = String(position + 1);
+      const color = buttonColor(buttonFor(position));
+      if (color) {
+        badge.style.background = color.css;
+        badge.style.color = color.light ? '#111' : '#fff';
+      }
+      return badge;
+    }));
+  }
+
+  // The color a button shows: its own background, or the first one set inside it. A see-through color
+  // is taken as it looks over a white page.
+  function buttonColor(el) {
+    if (!el) return null;
+    for (const node of [el, ...el.querySelectorAll('*')].slice(0, 30)) {
+      const parts = getComputedStyle(node).backgroundColor.match(/[\d.]+/g);
+      if (!parts || parts.length < 3) continue;
+      const [r, g, b, a = 1] = parts.map(Number);
+      if (a < 0.05) continue;
+      const [R, G, B] = [r, g, b].map((v) => Math.round(v * a + 255 * (1 - a)));
+      return { css: `rgb(${R}, ${G}, ${B})`, light: 0.299 * R + 0.587 * G + 0.114 * B > 160 };
+    }
+    return null;
   }
 
   // With no key the settings stay open, since there's nothing to do until one is pasted.
@@ -1437,7 +1479,7 @@ ${lettered(q.groups)}`,
           <span class="logo">⚡</span>
           <div class="readout">
             <div id="kahoot-status" class="status">Waiting for question...</div>
-            <div id="kahoot-answer" class="answer">—</div>
+            <div class="answer-line"><span id="kahoot-picks" class="picks"></span><span id="kahoot-answer" class="answer">—</span></div>
           </div>
           <button id="kahoot-toggle" class="icon" type="button" aria-label="Settings" aria-expanded="false">⚙</button>
           <button id="kahoot-off" class="icon" type="button" aria-label="Hide completely"
@@ -1614,6 +1656,15 @@ ${lettered(q.groups)}`,
     handleQuestion(q, round);
   }
 
+  // Where the picked answers are on screen: the button found, or on AhaSlides every option picked when
+  // several are right. None when the answer isn't a button to tap.
+  function picksOnScreen(q, answer, button) {
+    if (button === null) return [];
+    if (SITE !== 'aha') return [button];
+    const options = ahaEls('audience-quiz-option');
+    return [].concat(answer).map((index) => options.indexOf(ahaOption(q.answers.find((a) => a.index === index).id))).filter((i) => i >= 0);
+  }
+
   // Wait this long before answering, so it isn't instant, but never so long that the timer runs out.
   function answerDelay(q, since) {
     const wanted = prefs.delayMin + Math.random() * (prefs.delayMax - prefs.delayMin);
@@ -1654,6 +1705,7 @@ ${lettered(q.groups)}`,
 
       r.pick = button ?? undefined; // AhaSlides has nothing to highlight but multiple choice
       syncMark();
+      if (!r.cancelled) setPicks(picksOnScreen(q, answer, button));
       const delay = answerDelay(q, SITE === 'aha' ? r.liveAt : q.source === 'dom' ? r.startedAt : Date.now());
       if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
       else say('Auto-answer is off — answer above');
