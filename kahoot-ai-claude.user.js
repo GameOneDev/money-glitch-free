@@ -38,7 +38,8 @@
   // How long to wait for Claude, and for Claude with web search, before giving up.
   const API_TIMEOUT_MS = 20000;
   const SEARCH_TIMEOUT_MS = 40000;
-  // A random pause before sending the answer, so it isn't instant. Both at 0 answers at once.
+  // A random pause before sending the answer, so it isn't instant. Both at 0 answers at once. The
+  // panel's slider for it goes from 0 to 2 s.
   const ANSWER_DELAY_MIN = 150;
   const ANSWER_DELAY_MAX = 700;
   // Never wait so long that less than this much of the question's timer is left to answer in.
@@ -80,8 +81,8 @@
     // still works.
     ui:         { key: "kahoot-ai-ui",          fallback: "compact", options: ["compact", "open", "hidden", "off"] },
     // The Advanced section. Times are kept in milliseconds, and the panel shows seconds.
-    delayMin:      { key: "kahoot-ai-delay-min",      fallback: ANSWER_DELAY_MIN,  min: 0,     max: 30000 },
-    delayMax:      { key: "kahoot-ai-delay-max",      fallback: ANSWER_DELAY_MAX,  min: 0,     max: 30000 },
+    delayMin:      { key: "kahoot-ai-delay-min",      fallback: ANSWER_DELAY_MIN,  min: 0,     max: 2000 },
+    delayMax:      { key: "kahoot-ai-delay-max",      fallback: ANSWER_DELAY_MAX,  min: 0,     max: 2000 },
     margin:        { key: "kahoot-ai-margin",         fallback: TIMER_MARGIN_MS,   min: 0,     max: 30000 },
     effort:        { key: "kahoot-ai-effort",         fallback: EFFORT,            options: Object.keys(TOKENS_BY_EFFORT) },
     maxSearches:   { key: "kahoot-ai-max-searches",   fallback: MAX_SEARCHES,      min: 1,     max: 10 },
@@ -1155,10 +1156,11 @@ ${lettered(q.groups)}`,
   ];
 
   // The Advanced section, folded away until asked for. `scale` turns the saved value into what's shown
-  // (milliseconds into seconds). A field with options in PREFS is a menu, the rest are numbers.
+  // (milliseconds into seconds). A field with options in PREFS is a menu, the rest are numbers. The two
+  // delays share one row, with a two-thumb slider (delayRow).
   const ADVANCED = [
-    { name: 'delayMin', label: 'Answer delay, shortest', hint: 'Wait at least this long before answering', unit: 's', scale: 1000, step: 0.05 },
-    { name: 'delayMax', label: 'Answer delay, longest', hint: 'A random wait up to this. Both at 0 answers at once', unit: 's', scale: 1000, step: 0.05 },
+    { name: 'delayMin', label: 'Shortest answer delay', unit: 's', scale: 1000, slider: true },
+    { name: 'delayMax', label: 'Longest answer delay', unit: 's', scale: 1000, slider: true },
     { name: 'margin', label: 'Timer margin', hint: "Always leave this much of the question's timer", unit: 's', scale: 1000, step: 0.5 },
     { name: 'effort', label: 'Thinking effort', hint: 'Higher is slower, and better on hard questions' },
     { name: 'maxSearches', label: 'Web searches', hint: 'The most it may run per question', unit: '', scale: 1, step: 1 },
@@ -1252,6 +1254,29 @@ ${lettered(q.groups)}`,
     .row-field select { flex: none; width: 112px; max-width: none; }
     .num-wrap { display: flex; align-items: center; gap: 6px; flex: none; }
     .num { flex: none; width: 88px; text-align: right; }
+    .num.short { width: 64px; padding: 0 6px; text-align: center; }
+
+    .range-field { flex-direction: column; align-items: stretch; gap: 0; padding-bottom: 2px; }
+    .range-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .dual {
+      position: relative; height: 44px; cursor: pointer; touch-action: pan-y;
+      user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    }
+    .dual-rail, .dual-ticks { position: absolute; left: 14px; right: 14px; }
+    .dual-rail { top: 0; bottom: 0; }
+    .dual-track {
+      position: absolute; left: 0; right: 0; top: 50%; height: 6px; margin-top: -3px;
+      border-radius: 3px; background: #30363d;
+    }
+    .dual-fill { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: #238636; }
+    .dual-thumb {
+      position: absolute; top: 50%; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%;
+      background: #e2e8f0; box-shadow: 0 1px 4px rgba(0, 0, 0, .5); outline: none; transition: box-shadow .1s;
+    }
+    .dual-thumb.active { z-index: 1; box-shadow: 0 0 0 9px rgba(63, 185, 80, .3); }
+    .dual-thumb:focus-visible { box-shadow: 0 0 0 3px #58a6ff; }
+    .dual-scale { position: relative; height: 16px; margin-top: -6px; color: #8b949e; font-size: 11px; }
+    .dual-ticks span { position: absolute; top: 0; transform: translateX(-50%); }
     .unit { min-width: 8px; color: #8b949e; font-size: 13px; }
     .chev { flex: none; color: #8b949e; font-size: 16px; }
     .reset {
@@ -1388,6 +1413,120 @@ ${lettered(q.groups)}`,
       // Not while it's being typed in.
       if (field && root.activeElement !== field) field.value = PREFS[name].options ? prefs[name] : shown(prefs[name] / scale);
     }
+    renderDelay();
+  }
+
+  // ── ANSWER DELAY SLIDER ───────────────────────────────────────
+  // One track with a thumb for the shortest wait and one for the longest. It isn't linear: a thumb's
+  // place is the square root of its delay, so the half nearest 0 covers 0 to 0.5 s and the short waits
+  // can be set finely with a finger. A thumb dragged past the other swaps with it and carries on as the
+  // other end, so two thumbs on the same spot pull apart whichever way they're dragged. The boxes above
+  // it take a typed value.
+  const DELAY_TOP = PREFS.delayMax.max;
+  const DELAY_TICKS = [0, 0.25, 0.5, 1, 2];
+  const delayPos = (ms) => Math.sqrt(Math.min(Math.max(ms, 0), DELAY_TOP) / DELAY_TOP);
+  // Rounded to 10 ms, or to 50 ms from a second up, where a pixel is worth more.
+  function delayAt(pos) {
+    const ms = DELAY_TOP * Math.min(Math.max(pos, 0), 1) ** 2;
+    const step = ms < 1000 ? 10 : 50;
+    return Math.round(ms / step) * step;
+  }
+  // A drag in progress, shown but not saved until the finger lifts.
+  let delayDrag = null;
+
+  function renderDelay() {
+    const slider = $('kahoot-delay');
+    if (!slider) return;
+    const values = delayDrag?.values ?? [prefs.delayMin, prefs.delayMax];
+    const [lo, hi] = values.map((v) => delayPos(v) * 100);
+    const fill = $('kahoot-delay-fill');
+    fill.style.left = `${lo}%`;
+    fill.style.width = `${hi - lo}%`;
+    ['delayMin', 'delayMax'].forEach((name, i) => {
+      const thumb = $(`kahoot-delay-${i}`);
+      thumb.style.left = `${i ? hi : lo}%`;
+      thumb.classList.toggle('active', delayDrag?.active === i);
+      thumb.setAttribute('aria-valuenow', shown(values[i] / 1000));
+      thumb.setAttribute('aria-valuetext', `${shown(values[i] / 1000)} s`);
+      thumb.setAttribute('aria-valuemin', i ? shown(values[0] / 1000) : '0');
+      thumb.setAttribute('aria-valuemax', i ? String(DELAY_TOP / 1000) : shown(values[1] / 1000));
+      const field = $(`kahoot-adv-${name}`);
+      if (root.activeElement !== field) field.value = shown(values[i] / 1000);
+    });
+  }
+
+  function setDelay(lo, hi) {
+    if (lo === prefs.delayMin && hi === prefs.delayMax) { renderDelay(); return; }
+    setPref('delayMin', lo);
+    setPref('delayMax', hi);
+    setStatus(`Answer delay: ${shown(lo / 1000)} to ${shown(hi / 1000)} s`);
+  }
+
+  // A finger or the mouse on the slider: grabbing a thumb drags it from where it was taken, and a tap
+  // elsewhere on the track brings the nearer thumb there. Nothing moves until the pointer does, or lifts,
+  // so a swipe that turns out to be scrolling the settings (the browser then cancels it) changes nothing.
+  function startDelayDrag(e) {
+    if (e.button !== 0 || delayDrag) return;
+    // A box being typed in saves first, so the drag starts from its value.
+    if (root.activeElement?.tagName === 'INPUT') root.activeElement.blur();
+    const rail = $('kahoot-delay-rail').getBoundingClientRect();
+    if (!rail.width) return;
+    const posAt = (x) => (x - rail.left) / rail.width;
+    const values = [prefs.delayMin, prefs.delayMax];
+    const at = posAt(e.clientX);
+    const gap = values.map((v) => Math.abs(delayPos(v) - at) * rail.width);
+    const active = gap[0] < gap[1] || (gap[0] === gap[1] && at < delayPos(values[0])) ? 0 : 1;
+    const grabbed = gap[active] <= 22;
+    delayDrag = { pointer: e.pointerId, x: e.clientX, y: e.clientY, posAt, values, active, offset: grabbed ? at - delayPos(values[active]) : 0 };
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    // With a mouse the arrow keys can carry on from here.
+    if (e.pointerType === 'mouse') $(`kahoot-delay-${active}`).focus({ preventScroll: true });
+    renderDelay();
+  }
+
+  function moveDelayDrag(e) {
+    const d = delayDrag;
+    if (d?.pointer !== e.pointerId) return;
+    d.values[d.active] = delayAt(d.posAt(e.clientX) - d.offset);
+    if (d.values[0] > d.values[1]) {
+      d.values.reverse();
+      d.active = 1 - d.active;
+      if (root.activeElement?.classList.contains('dual-thumb')) $(`kahoot-delay-${d.active}`).focus({ preventScroll: true });
+    }
+    renderDelay();
+  }
+
+  function endDelayDrag(e) {
+    if (delayDrag?.pointer !== e.pointerId) return;
+    if (e.type === 'pointerup') moveDelayDrag(e);
+    const [lo, hi] = delayDrag.values;
+    delayDrag = null;
+    if (e.type === 'pointerup') setDelay(lo, hi);
+    else renderDelay();
+  }
+
+  // Chrome takes a quick sideways flick for the start of a fling even though nothing here scrolls
+  // sideways, and the fling swallows the next tap. Holding back the moves of a sideways drag stops that;
+  // an up-and-down swipe is left to scroll the settings.
+  function holdDelayTouch(e) {
+    const t = e.touches[0];
+    if (delayDrag && e.cancelable && Math.abs(t.clientX - delayDrag.x) >= Math.abs(t.clientY - delayDrag.y)) e.preventDefault();
+  }
+
+  // Arrow keys move a focused thumb a notch along the track, Page Up and Down ten, Home and End to the
+  // ends. It stops at the other thumb.
+  function delayKey(e, i) {
+    const values = [prefs.delayMin, prefs.delayMax];
+    const notches = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: -10, PageUp: 10, Home: -Infinity, End: Infinity }[e.key];
+    if (!notches) return;
+    e.preventDefault();
+    const from = values[i];
+    let next = delayAt(delayPos(from) + notches * 0.01);
+    if (next === from) next = from + Math.sign(notches) * (from < 1000 ? 10 : 50);
+    next = Math.min(Math.max(next, 0), DELAY_TOP);
+    values[i] = i ? Math.max(next, values[0]) : Math.min(next, values[1]);
+    setDelay(...values);
   }
 
   function renderAdvanced() {
@@ -1397,10 +1536,10 @@ ${lettered(q.groups)}`,
   }
 
   // A number typed into the Advanced section: keep it if it's in range, otherwise say what's allowed and
-  // put the old one back.
+  // put the old one back. A decimal comma counts as a point.
   function commitNumber(spec, input) {
     const { min, max } = PREFS[spec.name];
-    const typed = parseFloat(input.value);
+    const typed = parseFloat(input.value.replace(',', '.'));
     const value = Math.round(typed * spec.scale);
     if (!Number.isFinite(typed) || value < min || value > max) {
       setStatus(`${spec.label}: use ${min / spec.scale} to ${max / spec.scale}${spec.unit ? ' ' + spec.unit : ''}`, '#f85149');
@@ -1466,6 +1605,36 @@ ${lettered(q.groups)}`,
       </label>`;
   };
 
+  // Text boxes rather than number ones, so a decimal comma works, the phone shows its number pad, and a
+  // tap selects what's there for typing over.
+  const delayBox = ({ name, label }) => `
+    <input id="kahoot-adv-${name}" class="num short" type="text" inputmode="decimal" enterkeyhint="done"
+      autocomplete="off" spellcheck="false" aria-label="${label}, seconds">`;
+
+  const delayRow = () => `
+    <div class="row-field range-field">
+      <div class="range-head">
+        <span>Answer delay</span>
+        <span class="num-wrap">
+          ${delayBox(ADVANCED.find((f) => f.name === 'delayMin'))}
+          <span class="unit">to</span>
+          ${delayBox(ADVANCED.find((f) => f.name === 'delayMax'))}
+          <span class="unit">s</span>
+        </span>
+      </div>
+      <span class="hint">A random wait in this range before answering. Both at 0 answers at once</span>
+      <div id="kahoot-delay" class="dual">
+        <div id="kahoot-delay-rail" class="dual-rail">
+          <div class="dual-track"><div id="kahoot-delay-fill" class="dual-fill"></div></div>
+          <div id="kahoot-delay-0" class="dual-thumb" role="slider" tabindex="0" aria-label="Shortest answer delay"></div>
+          <div id="kahoot-delay-1" class="dual-thumb" role="slider" tabindex="0" aria-label="Longest answer delay"></div>
+        </div>
+      </div>
+      <div class="dual-scale" aria-hidden="true">
+        <div class="dual-ticks">${DELAY_TICKS.map((s) => `<span style="left:${delayPos(s * 1000) * 100}%">${s}</span>`).join('')}</div>
+      </div>
+    </div>`;
+
   function buildUI() {
     const host = document.createElement('div');
     host.id = 'kahoot-ai-host';
@@ -1509,7 +1678,8 @@ ${lettered(q.groups)}`,
             <span id="kahoot-adv-chev" class="chev">▸</span>
           </button>
           <div id="kahoot-advanced" hidden>
-            ${ADVANCED.map(fieldRow).join('')}
+            ${delayRow()}
+            ${ADVANCED.filter((f) => !f.slider).map(fieldRow).join('')}
             ${ADVANCED_SWITCHES.map(switchRow).join('')}
             <button id="kahoot-adv-reset" class="reset" type="button">Reset advanced to defaults</button>
           </div>
@@ -1530,7 +1700,16 @@ ${lettered(q.groups)}`,
       const field = $(`kahoot-adv-${spec.name}`);
       field.addEventListener('change', () => (PREFS[spec.name].options ? setPref(spec.name, field.value) : commitNumber(spec, field)));
       field.addEventListener('keydown', (e) => { if (e.key === 'Enter') field.blur(); });
+      // A tick later, or the tap that focused it puts the caret back.
+      if (spec.slider) field.addEventListener('focus', () => setTimeout(() => field.select()));
     }
+    const delaySlider = $('kahoot-delay');
+    delaySlider.addEventListener('pointerdown', startDelayDrag);
+    delaySlider.addEventListener('pointermove', moveDelayDrag);
+    delaySlider.addEventListener('pointerup', endDelayDrag);
+    delaySlider.addEventListener('pointercancel', endDelayDrag);
+    delaySlider.addEventListener('touchmove', holdDelayTouch, { passive: false });
+    [0, 1].forEach((i) => $(`kahoot-delay-${i}`).addEventListener('keydown', (e) => delayKey(e, i)));
     $('kahoot-adv-toggle').addEventListener('click', () => {
       advancedOpen = !advancedOpen;
       renderAdvanced();
