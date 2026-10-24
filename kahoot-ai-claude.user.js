@@ -20,11 +20,14 @@
   // ── SETTINGS ──────────────────────────────────────────────────
   // The API key isn't here: paste it in the panel. It's kept in the browser, so updating the script
   // doesn't wipe it and it can't end up in a repo.
-  // The panel's model menu. The first one is where it starts; after that it remembers.
+  // The panel's model menu. The first one is where it starts; after that it remembers. On a set of 70
+  // quiz questions at low effort, Haiku got 67 right, Sonnet 69 and Opus 70, with Haiku and Sonnet both
+  // answering in about 0.8 s and Opus in about 1.2 s. The niche ones (X-COM and other games) are where
+  // the smaller two slip, and a question costs about a tenth of a cent on Opus.
   const MODELS = [
-    { id: "claude-haiku-5-5", name: "Haiku 5.5" },
-    { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
     { id: "claude-opus-5-5", name: "Opus 5.5" },
+    { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
+    { id: "claude-haiku-5-5", name: "Haiku 5.5" },
     // { id: "claude-fable-5-1", name: "Fable 5.1" },
   ];
   // Fast mode (speed: "fast") is a research preview that only some models have, at twice the price.
@@ -239,7 +242,7 @@
 
   // Walk any JSON the page gets. Socket messages can carry their JSON as a string inside JSON, or after
   // a numeric frame prefix ("42[...]"), so strings that look like JSON are opened up too.
-  function handleMentiData(node, depth = 0, parentKey = "", slideType = "") {
+  function handleMentiData(node, depth = 0, parentKey = "", slideType = "", slideId = "") {
     if (node == null || depth > 12) return;
     if (typeof node === "string") {
       const text = node.trim().replace(/^\d+(?=[[{])/, "");
@@ -252,7 +255,7 @@
     }
     if (typeof node !== "object") return;
     if (Array.isArray(node)) {
-      for (const value of node) handleMentiData(value, depth + 1, "", slideType);
+      for (const value of node) handleMentiData(value, depth + 1, "", slideType, slideId);
       return;
     }
     if (parentKey === "pace" && node.active != null && String(node.active) !== mentiActive) {
@@ -260,11 +263,13 @@
       if (prefs.trace) console.log(LOG, "Active question:", mentiActive);
     }
     slideType = node.static_content?.type ?? node.staticContent?.type ?? slideType;
-    learnMentiQuestion(node, slideType);
-    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key, slideType);
+    // The slide's own id goes down with its type: that's the one pace.active is likely to name.
+    if ((node.static_content || node.staticContent) && node.id != null) slideId = String(node.id);
+    learnMentiQuestion(node, slideType, slideId);
+    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key, slideType, slideId);
   }
 
-  function learnMentiQuestion(node, slideType) {
+  function learnMentiQuestion(node, slideType, slideId) {
     const title = [node.question, node.title, node.heading].find((t) => typeof t === "string" && t.trim());
     const list = [node.choices, node.options].find(Array.isArray);
     if (!title || !list || list.length < 2) return;
@@ -274,7 +279,7 @@
     }));
     if (answers.some((a) => !a.text)) return;
     const question = cleanText(title);
-    const ids = [node.id, node.public_key, node.publicKey, node.admin_key, node.interactive_content_id, node.interactiveContentId]
+    const ids = [node.id, node.public_key, node.publicKey, node.admin_key, node.interactive_content_id, node.interactiveContentId, slideId]
       .filter((v) => v != null && v !== "").map(String);
     const id = ids[0] ?? textKey(question);
     const type = String(node.type ?? slideType ?? "");
@@ -446,11 +451,14 @@
       if (els) found.push({ q, els });
     }
     if (found.length) {
-      // Two questions can share their choices (true / false). Prefer the one whose text is on screen,
-      // then the one the traffic says is up, then the newest.
+      // Two questions can share their choices (true / false, or the numbers 1 to 4). Prefer the one whose
+      // text is on screen, then the one the traffic says is up, then the one whose answers are in the
+      // order they're shown, then the newest. Only the text a player can see counts: the page's own
+      // scripts can hold every question of the quiz.
       if (found.length > 1) {
-        const pageKey = textKey(document.body?.textContent);
-        const score = ({ q }) => (pageKey.includes(textKey(q.question)) ? 4 : 0) + (q.ids.includes(mentiActive) ? 2 : 0);
+        const pageKey = textKey(document.body?.innerText);
+        const inOrder = (els) => els.every((el, i) => !i || els[i - 1].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+        const score = ({ q, els }) => (pageKey.includes(textKey(q.question)) ? 4 : 0) + (q.ids.includes(mentiActive) ? 2 : 0) + (inOrder(els) ? 1 : 0);
         found.sort((a, b) => score(b) - score(a) || b.q.seen - a.q.seen);
       }
       return found[0];
@@ -678,22 +686,29 @@
   // What to ask for each kind, how to read the reply (null when it holds no usable answer), and how to
   // show the answer in the panel.
   const KINDS = {
+    // The answers are lettered, not numbered: a number can be an answer itself ("3" among 1, 2, 3, 4), and
+    // then its own number and its place in the list can't be told apart.
     choice: {
       ask: (q) => `${q.multi
-        ? `More than one answer may be correct: pick every correct one and no wrong ones. Reply with ONLY the numbers of the correct answers (${q.answers.map((a) => a.index).join(', ')}), separated by commas. No explanation.`
-        : `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.`}
+        ? `More than one answer may be correct: pick every correct one and no wrong ones. Reply with ONLY the letters of the correct answers (${q.answers.map((a) => LETTERS[a.index]).join(', ')}), separated by commas. No explanation.`
+        : `Reply with ONLY the letter of the correct answer (${q.answers.map((a) => LETTERS[a.index]).join(', ')}). No explanation, no punctuation, just the letter.`}
 
 Question: ${asked(q)}
 
 Answers:
-${listed(q.answers)}`,
-      // The last whole number that is one of the answers, so a "2007" in its words can't be mistaken for one.
-      // With several right, every answer's number on the last line that has any.
+${lettered(q.answers)}`,
+      // A lone letter on the last line, plain or dressed up ("B", "(B)", "**B**", "Answer: B"); failing that,
+      // the last capital letter that is one of the answers, so an "A" starting a sentence can't win over
+      // the letter after it. With several right, every answer's letter on the last line that has any.
       read: (q, text) => {
-        const answerNumbers = (line) => (line.match(/\b\d+\b/g) || []).map(Number).filter((n) => q.answers.some((a) => a.index === n));
-        if (q.multi) return text.split('\n').reverse().map((line) => [...new Set(answerNumbers(line))]).find((picks) => picks.length) ?? null;
-        const numbers = answerNumbers(text);
-        return numbers.length ? numbers[numbers.length - 1] : null;
+        const index = new Map(q.answers.map((a) => [LETTERS[a.index], a.index]));
+        const capitals = (s) => [...s.matchAll(/\b([A-Z])\b/g)].map((m) => m[1]).filter((l) => index.has(l));
+        const lines = text.split('\n').map((l) => l.trim()).filter(Boolean).reverse();
+        if (q.multi) return lines.map((line) => [...new Set(capitals(line))].map((l) => index.get(l))).find((picks) => picks.length) ?? null;
+        const lone = lines[0]?.match(/^(?:answer\W*)?[\s*_`(["']*([A-Za-z])[\s*_`)\]"'.:,!]*$/i)?.[1].toUpperCase();
+        if (lone && index.has(lone)) return index.get(lone);
+        const last = capitals(text).pop();
+        return last ? index.get(last) : null;
       },
       show: (q, pick) => [].concat(pick).map((index) => nameOf(q.answers.find((a) => a.index === index))).join(', '),
     },
@@ -764,7 +779,8 @@ ${lettered(q.groups)}`,
   function pictureBlocks(q) {
     const labelled = [
       ...(q.image ? [["The question's picture", q.image]] : []),
-      ...[q.answers, q.items].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${p.index}`, p.image]),
+      ...(q.answers ?? []).filter((p) => p.image).map((p) => [`Picture ${LETTERS[p.index]}`, p.image]),
+      ...(q.items ?? []).filter((p) => p.image).map((p) => [`Picture ${p.index}`, p.image]),
       ...[q.matches, q.groups].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${LETTERS[p.index]}`, p.image]),
     ];
     return labelled.flatMap(([label, url]) => [{ type: 'text', text: `${label}:` }, { type: 'image', source: { type: 'url', url } }]);
