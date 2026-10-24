@@ -6,8 +6,8 @@
 // @match        https://kahoot.it/*
 // @match        https://www.menti.com/*
 // @match        https://menti.com/*
-// @match        https://ahaslides.com/*
-// @match        https://ahaslides.eu/*
+// @match        https://audience.ahaslides.com/*
+// @match        https://audience.ahaslides.eu/*
 // @grant        none
 // @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/GameOneDev/money-glitch-free/main/kahoot-ai-claude.user.js
