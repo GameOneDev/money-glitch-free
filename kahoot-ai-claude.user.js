@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise. A choice of model, optional web search and fast mode, and an optional answer highlight.
+// @version      4.5
+// @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic and taps the answer; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise, and sends the slide's pictures along. A choice of model, optional web search and fast mode, and an optional answer highlight.
 // @match        https://kahoot.it/*
 // @match        https://www.menti.com/*
 // @match        https://menti.com/*
@@ -225,6 +225,8 @@
   // its choices, and under "pace" which one is up. Its socket says when that changes. Keep every
   // question seen; the one being asked is whichever has its choices on screen (see READ THE PAGE).
   // Polls, word clouds, scales and the like have no right answer, so only quiz questions are answered.
+  // In the current format each slide's type ("quiz-choice", "multiple-choice", ...) is on the slide, in
+  // static_content, and its title and choices are a level down, in interactive_contents.
   const MENTI_QUIZ_TYPE = /^quiz/;
   const MENTI_TYPED_ANSWER = /open|type/;
   const mentiQuestions = new Map(); // id -> { ids, question, answers, type, seen }
@@ -232,7 +234,7 @@
 
   // Walk any JSON the page gets. Socket messages can carry their JSON as a string inside JSON, or after
   // a numeric frame prefix ("42[...]"), so strings that look like JSON are opened up too.
-  function handleMentiData(node, depth = 0, parentKey = "") {
+  function handleMentiData(node, depth = 0, parentKey = "", slideType = "") {
     if (node == null || depth > 12) return;
     if (typeof node === "string") {
       const text = node.trim().replace(/^\d+(?=[[{])/, "");
@@ -243,18 +245,19 @@
     }
     if (typeof node !== "object") return;
     if (Array.isArray(node)) {
-      for (const value of node) handleMentiData(value, depth + 1);
+      for (const value of node) handleMentiData(value, depth + 1, "", slideType);
       return;
     }
     if (parentKey === "pace" && node.active != null && String(node.active) !== mentiActive) {
       mentiActive = String(node.active);
       if (prefs.trace) console.log(LOG, "Active question:", mentiActive);
     }
-    learnMentiQuestion(node);
-    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key);
+    slideType = node.static_content?.type ?? node.staticContent?.type ?? slideType;
+    learnMentiQuestion(node, slideType);
+    for (const [key, value] of Object.entries(node)) handleMentiData(value, depth + 1, key, slideType);
   }
 
-  function learnMentiQuestion(node) {
+  function learnMentiQuestion(node, slideType) {
     const title = [node.question, node.title, node.heading].find((t) => typeof t === "string" && t.trim());
     const list = [node.choices, node.options].find(Array.isArray);
     if (!title || !list || list.length < 2) return;
@@ -264,11 +267,13 @@
     }));
     if (answers.some((a) => !a.text)) return;
     const question = cleanText(title);
-    const ids = [node.id, node.public_key, node.publicKey, node.admin_key].filter((v) => v != null && v !== "").map(String);
+    const ids = [node.id, node.public_key, node.publicKey, node.admin_key, node.interactive_content_id, node.interactiveContentId]
+      .filter((v) => v != null && v !== "").map(String);
     const id = ids[0] ?? textKey(question);
+    const type = String(node.type ?? slideType ?? "");
     const known = mentiQuestions.get(id);
-    mentiQuestions.set(id, { ids, question, answers, type: String(node.type ?? ""), seen: ++seq });
-    if (!known && prefs.trace) console.log(LOG, `Learned ${node.type ?? "a"} question:`, question, answers.map((a) => a.text));
+    mentiQuestions.set(id, { ids, question, answers, type, seen: ++seq });
+    if (!known && prefs.trace) console.log(LOG, `Learned ${type || "a"} question:`, question, answers.map((a) => a.text));
   }
 
   const isCometdUrl = url => String(url ?? "").includes("/cometd/");
@@ -486,8 +491,20 @@
     }
     return copy;
   }
+  // A picture's address. The slide's own picture comes in sizes; an option's is a plain address.
+  function pictureUrl(image) {
+    const address = typeof image === "string" ? image : image?.large ?? image?.original;
+    if (!address) return null;
+    try {
+      const url = new URL(address, location.href);
+      return /^https?:$/.test(url.protocol) ? url.href : null;
+    } catch (_) { return null; }
+  }
+
   // Parts as the asking side wants them, keeping the option's id and its place in the slide's list.
-  const numbered = (list, text) => list.map((item, index) => ({ index, text: cleanText(text(item)), id: item.id, slot: item.slot }));
+  const numbered = (list, text, image) => list.map((item, index) => ({
+    index, text: cleanText(text(item)), image: image ? pictureUrl(image(item)) : null, id: item.id, slot: item.slot,
+  }));
 
   // The quiz question on screen, from its rules screen on (so Claude can start before the timer does).
   // key is the slide, since two slides can ask the same thing, in brackets so slide 12 isn't a part of 123.
@@ -496,20 +513,20 @@
     if (!slide || slide.type !== "pickAnswer" || !Object.values(AHA_STATUS).includes(slide.quizStatus)) return null;
     const kind = slide.slideType ? AHA_KINDS[slide.slideType] : "choice";
     const q = { kind, slideId: String(slide.id), key: `ahaslides-slide[${slide.id}]`, question: cleanText(slide.title),
-      time: Number(slide.timeToAnswer) * 1000 || 0, source: "page" };
+      image: slide.image ? pictureUrl(slide.image) : null, time: Number(slide.timeToAnswer) * 1000 || 0, source: "page" };
     if (!kind) return { ...q, unsupported: slide.slideType };
     const options = (slide.SlideOptions ?? []).map((o, slot) => ({ id: o.id, slot, o }));
     try {
       if (kind === "choice") {
         q.kind = undefined;
         q.multi = !!slide.multipleChoice;
-        q.answers = numbered(options.filter(({ o }) => o.title || o.image || o.imageCropped), ({ o }) => o.title);
+        q.answers = numbered(options.filter(({ o }) => o.title || o.image || o.imageCropped), ({ o }) => o.title, ({ o }) => o.imageCropped || o.image);
       } else if (kind === "order") {
         q.items = numbered(shuffled(options.filter(({ id }) => id)), ({ o }) => o.title);
       } else if (kind === "match") {
         const pairs = options.filter(({ o }) => (o.title || o.image) && (o.pairTitle || o.pairImage));
-        q.items = numbered(pairs, ({ o }) => o.title);
-        q.matches = numbered(shuffled(pairs), ({ o }) => o.pairTitle);
+        q.items = numbered(pairs, ({ o }) => o.title, ({ o }) => o.imageCropped || o.image);
+        q.matches = numbered(shuffled(pairs), ({ o }) => o.pairTitle, ({ o }) => o.pairImageCropped || o.pairImage);
       } else if (kind === "categorise") {
         const groups = JSON.parse(slide.matchingQuestionOptions);
         q.groups = numbered(groups, (g) => g.value);
@@ -519,9 +536,11 @@
       console.debug(LOG, "Couldn't read the slide:", e.message);
       return null;
     }
-    // Claude only gets text, so a question or a part that's only a picture can't be answered.
+    // Pictures go to Claude too, but one whose address can't be read leaves nothing to go on.
     const parts = [q.answers, q.items, q.matches, q.groups].filter(Boolean).flat();
-    if (!q.question || parts.some((p) => !p.text) || (kind !== "text" && !parts.length)) return { ...q, unsupported: "picture" };
+    if ((!q.question && !q.image) || parts.some((p) => !p.text && !p.image) || (kind !== "text" && !parts.length)) {
+      return { ...q, unsupported: "picture" };
+    }
     return q;
   }
 
@@ -600,8 +619,14 @@
   //   match:      q.items and q.matches, answered with a match for each item, each match used once.
   //   categorise: q.items and q.groups, answered with a group for each item.
   // Items are numbered and the things they go with lettered, so the two can't be mixed up.
+  // The question and any part can also have a picture (q.image, p.image: its address), and a part can be
+  // only a picture. The list names each picture, and the pictures go along labelled the same way (see
+  // pictureBlocks).
   const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const listed = (parts, label = (i) => i) => parts.map((p) => `${label(p.index)}: ${p.text}`).join('\n');
+  const described = (p, label) => [p.text, p.image && `[picture ${label}]`].filter(Boolean).join(' ');
+  const listed = (parts, label = (i) => i) => parts.map((p) => `${label(p.index)}: ${described(p, label(p.index))}`).join('\n');
+  const asked = (q) => [q.question, q.image && "[the question's picture]"].filter(Boolean).join(' ');
+  const nameOf = (p) => p.text || 'a picture';
   const lettered = (parts) => listed(parts, (i) => LETTERS[i]);
   const PAIRS_HOW = 'Reply with ONLY one line per item, its number then its letter (for example 0: B). No explanation.';
 
@@ -628,7 +653,7 @@
         ? `More than one answer may be correct: pick every correct one and no wrong ones. Reply with ONLY the numbers of the correct answers (${q.answers.map((a) => a.index).join(', ')}), separated by commas. No explanation.`
         : `Reply with ONLY the number of the correct answer (${q.answers.map((a) => a.index).join(', ')}). No explanation, no punctuation, just the number.`}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Answers:
 ${listed(q.answers)}`,
@@ -640,12 +665,12 @@ ${listed(q.answers)}`,
         const numbers = answerNumbers(text);
         return numbers.length ? numbers[numbers.length - 1] : null;
       },
-      show: (q, pick) => [].concat(pick).map((index) => q.answers.find((a) => a.index === index)?.text || '?').join(', '),
+      show: (q, pick) => [].concat(pick).map((index) => nameOf(q.answers.find((a) => a.index === index))).join(', '),
     },
     text: {
       ask: (q) => `There are no answers to pick from: the answer is typed in, and checked against the expected one. Reply with ONLY the answer, as short as it can be put (usually a word, a name or a number). No explanation, no quotes, no full stop.
 
-Question: ${q.question}`,
+Question: ${asked(q)}`,
       // The last line, without quotes or bold around it, or a full stop after it.
       read: (q, text) => {
         const line = text.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
@@ -657,7 +682,7 @@ Question: ${q.question}`,
     order: {
       ask: (q) => `Put these items in the correct order. Reply with ONLY their numbers in that order, first to last, separated by commas (for example 2, 0, 1). No explanation.
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}`,
@@ -669,12 +694,12 @@ ${listed(q.items)}`,
         }
         return null;
       },
-      show: (q, order) => order.map((i) => q.items.find((p) => p.index === i).text).join(' → '),
+      show: (q, order) => order.map((i) => nameOf(q.items.find((p) => p.index === i))).join(' → '),
     },
     match: {
       ask: (q) => `Match each numbered item with the lettered one it goes with. Each letter goes with one item. ${PAIRS_HOW}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}
@@ -682,12 +707,12 @@ ${listed(q.items)}
 Matches:
 ${lettered(q.matches)}`,
       read: (q, text) => readPairs(q.items, q.matches, text, true),
-      show: (q, picks) => q.items.map((p) => `${p.text} = ${q.matches.find((m) => m.index === picks[p.index]).text}`).join('; '),
+      show: (q, picks) => q.items.map((p) => `${nameOf(p)} = ${nameOf(q.matches.find((m) => m.index === picks[p.index]))}`).join('; '),
     },
     categorise: {
       ask: (q) => `Sort each numbered item into the lettered group it belongs in. ${PAIRS_HOW}
 
-Question: ${q.question}
+Question: ${asked(q)}
 
 Items:
 ${listed(q.items)}
@@ -704,6 +729,42 @@ ${lettered(q.groups)}`,
   };
   const kindOf = (q) => KINDS[q.kind ?? 'choice'];
 
+  // The question's pictures, each after a line saying whose it is, as the list in the question names it.
+  // Claude fetches them from their addresses.
+  function pictureBlocks(q) {
+    const labelled = [
+      ...(q.image ? [["The question's picture", q.image]] : []),
+      ...[q.answers, q.items].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${p.index}`, p.image]),
+      ...[q.matches, q.groups].filter(Boolean).flat().filter((p) => p.image).map((p) => [`Picture ${LETTERS[p.index]}`, p.image]),
+    ];
+    return labelled.flatMap(([label, url]) => [{ type: 'text', text: `${label}:` }, { type: 'image', source: { type: 'url', url } }]);
+  }
+
+  // Some hosts won't hand their pictures to Claude. Then the page fetches them and sends them along as
+  // data, which works where the host lets other sites read its pictures.
+  async function inlinePictures(content) {
+    try {
+      return await Promise.all(content.map(async (block) => {
+        if (block.type !== 'image') return block;
+        const response = await fetch(block.source.url);
+        const blob = await response.blob();
+        const type = blob.type.replace('image/jpg', 'image/jpeg');
+        if (!response.ok || !/^image\/(jpeg|png|gif|webp)$/.test(type)) throw new Error(`${response.status} ${type || 'no type'}`);
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(',')[1]);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+        return { type: 'image', source: { type: 'base64', media_type: type, data } };
+      }));
+    } catch (e) {
+      const error = new Error(`Couldn't send the pictures to Claude (${e.message})`);
+      error.fatal = true; // trying again won't load them either
+      throw error;
+    }
+  }
+
   // Claude's answer: an answer's number for multiple choice, otherwise whatever that kind's read gives.
   // Null when the reply has no usable answer.
   async function askClaude(data) {
@@ -715,11 +776,14 @@ ${lettered(q.groups)}`,
     const search = prefs.webSearch;
     let fast = prefs.fast && fastModel();
     const prompt = `You are answering a quiz question. ${search ? 'If you are not sure of the answer you may search the web, but answer straight away when you know it. ' : ''}${kindOf(data).ask(data)}`;
+    // Pictures go first, then the question that names them.
+    const pictures = pictureBlocks(data);
+    let inlined = false;
 
     const body = {
       model: prefs.model,
       max_tokens: TOKENS_BY_EFFORT[prefs.effort] + (search ? SEARCH_EXTRA_TOKENS : 0),
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: pictures.length ? [...pictures, { type: 'text', text: prompt }] : prompt }],
       output_config: { effort: prefs.effort },
     };
     if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: prefs.maxSearches }];
@@ -733,6 +797,12 @@ ${lettered(q.groups)}`,
         console.log(LOG, 'Fast mode was refused, using normal speed:', reply.error?.message ?? `HTTP ${response.status}`);
         fast = false;
         ({ response, json: reply } = await callApi(body, false, timeoutMs));
+      }
+      if (response.status === 400 && pictures.length && !inlined && /image|url|download|fetch|media/i.test(reply.error?.message ?? '')) {
+        console.log(LOG, "Claude couldn't fetch the pictures, sending them from the page:", reply.error?.message);
+        inlined = true;
+        body.messages[0] = { role: 'user', content: await inlinePictures(body.messages[0].content) };
+        ({ response, json: reply } = await callApi(body, fast, timeoutMs));
       }
       if (response.status === 401) {
         const error = new Error('Invalid API key — paste a new one in the panel');
@@ -978,11 +1048,17 @@ ${lettered(q.groups)}`,
       vm.sortOption();
       return true;
     },
+    // The list a match is picked from belongs to a component that holds its options in the same order,
+    // so the wanted match is found by its option, which works for a picture as well as for text.
     match: async (q, picks, r) => {
       for (const item of q.items) {
-        const want = textKey(q.matches.find((m) => m.index === picks[item.index]).text);
+        const match = q.matches.find((m) => m.index === picks[item.index]);
         const slot = AHA_CONTROLS.match(q)?.[item.slot];
-        if (!(await pickFromList(q, r, slot, 'audience-quiz-match-pairs-pair-item', (el) => textIn(el, '.pair-title-text') === want))) return false;
+        const wanted = (el, i) => {
+          const list = vueOwner(el, (c) => Array.isArray(c.matchPairsOption))?.matchPairsOption;
+          return list ? String(list[i]?.id) === String(match.id) : textIn(el, '.pair-title-text') === textKey(match.text);
+        };
+        if (!(await pickFromList(q, r, slot, 'audience-quiz-match-pairs-pair-item', wanted))) return false;
       }
       return true;
     },
@@ -1129,7 +1205,14 @@ ${lettered(q.groups)}`,
       color: #8b949e; font-size: 12px; overflow: hidden; overflow-wrap: anywhere;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     }
-    .answer { color: #3fb950; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .answer-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .answer { min-width: 0; color: #3fb950; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .picks { display: flex; flex: none; gap: 4px; }
+    .picks:empty { display: none; }
+    .pick {
+      display: grid; place-items: center; min-width: 26px; height: 26px; padding: 0 6px; border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, .25); background: #30363d; color: #e2e8f0; font-size: 15px; font-weight: 800;
+    }
     .icon {
       flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0;
       border: 0; border-radius: 10px; background: transparent; color: #8b949e; font-size: 20px; cursor: pointer;
@@ -1193,9 +1276,44 @@ ${lettered(q.groups)}`,
     if (el) { el.textContent = text; el.style.color = color || ''; }
   }
 
+  // A new answer clears the badges, which belong to the one it replaces.
   function setAnswer(text, color) {
     const el = $('kahoot-answer');
     if (el) { el.textContent = text; el.style.color = color || ''; }
+    setPicks([]);
+  }
+
+  // A badge for each picked answer button, with its number on screen in its color, so it can be found
+  // at a glance (a Kahoot player's phone shows only the colors).
+  function setPicks(positions) {
+    const box = $('kahoot-picks');
+    if (!box) return;
+    box.replaceChildren(...positions.map((position) => {
+      const badge = document.createElement('span');
+      badge.className = 'pick';
+      badge.textContent = String(position + 1);
+      const color = buttonColor(buttonFor(position));
+      if (color) {
+        badge.style.background = color.css;
+        badge.style.color = color.light ? '#111' : '#fff';
+      }
+      return badge;
+    }));
+  }
+
+  // The color a button shows: its own background, or the first one set inside it. A see-through color
+  // is taken as it looks over a white page.
+  function buttonColor(el) {
+    if (!el) return null;
+    for (const node of [el, ...el.querySelectorAll('*')].slice(0, 30)) {
+      const parts = getComputedStyle(node).backgroundColor.match(/[\d.]+/g);
+      if (!parts || parts.length < 3) continue;
+      const [r, g, b, a = 1] = parts.map(Number);
+      if (a < 0.05) continue;
+      const [R, G, B] = [r, g, b].map((v) => Math.round(v * a + 255 * (1 - a)));
+      return { css: `rgb(${R}, ${G}, ${B})`, light: 0.299 * R + 0.587 * G + 0.114 * B > 160 };
+    }
+    return null;
   }
 
   // With no key the settings stay open, since there's nothing to do until one is pasted.
@@ -1361,7 +1479,7 @@ ${lettered(q.groups)}`,
           <span class="logo">⚡</span>
           <div class="readout">
             <div id="kahoot-status" class="status">Waiting for question...</div>
-            <div id="kahoot-answer" class="answer">—</div>
+            <div class="answer-line"><span id="kahoot-picks" class="picks"></span><span id="kahoot-answer" class="answer">—</span></div>
           </div>
           <button id="kahoot-toggle" class="icon" type="button" aria-label="Settings" aria-expanded="false">⚙</button>
           <button id="kahoot-off" class="icon" type="button" aria-label="Hide completely"
@@ -1538,6 +1656,15 @@ ${lettered(q.groups)}`,
     handleQuestion(q, round);
   }
 
+  // Where the picked answers are on screen: the button found, or on AhaSlides every option picked when
+  // several are right. None when the answer isn't a button to tap.
+  function picksOnScreen(q, answer, button) {
+    if (button === null) return [];
+    if (SITE !== 'aha') return [button];
+    const options = ahaEls('audience-quiz-option');
+    return [].concat(answer).map((index) => options.indexOf(ahaOption(q.answers.find((a) => a.index === index).id))).filter((i) => i >= 0);
+  }
+
   // Wait this long before answering, so it isn't instant, but never so long that the timer runs out.
   function answerDelay(q, since) {
     const wanted = prefs.delayMin + Math.random() * (prefs.delayMax - prefs.delayMin);
@@ -1578,6 +1705,7 @@ ${lettered(q.groups)}`,
 
       r.pick = button ?? undefined; // AhaSlides has nothing to highlight but multiple choice
       syncMark();
+      if (!r.cancelled) setPicks(picksOnScreen(q, answer, button));
       const delay = answerDelay(q, SITE === 'aha' ? r.liveAt : q.source === 'dom' ? r.startedAt : Date.now());
       if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
       else say('Auto-answer is off — answer above');
