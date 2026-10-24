@@ -1329,7 +1329,7 @@ ${lettered(q.groups)}`,
   const SWITCHES = [
     { name: 'autoAnswer', label: 'Auto-answer', hint: "Sends Claude's answer for you" },
     { name: 'highlight', label: 'Highlight answer', hint: 'A soft outline on the pick' },
-    { name: 'webSearch', label: 'Web search', hint: 'Recent and local facts. Each search is billed' },
+    { name: 'webSearch', label: 'Web search', hint: 'Right on recent and local facts. About 4 cents a question' },
     { name: 'fast', label: 'Fast mode', hint: 'Opus 5.5 only, at twice the price' },
     { name: 'prefetch', label: 'Answer ahead', hint: 'Menti: asks the whole quiz before it starts' },
   ];
