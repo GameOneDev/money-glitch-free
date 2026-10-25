@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kahoot AI Helper - Claude (HTTP + WebSocket)
 // @namespace    http://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  Answers Kahoot, Mentimeter (menti.com) and AhaSlides quiz questions with Claude. On Kahoot it auto-answers over the game's WebSocket and reads questions from its WebSocket or HTTP long-polling traffic, falling back to the page; on menti.com it reads the quiz from the voting page's traffic, answers the whole quiz ahead of time and taps the answer when its question comes up; on AhaSlides it reads the slide from the page and enters the answer, including short answer, correct order, match pairs and categorise, and sends the slide's pictures along. A choice of model, optional web search and fast mode, and an optional answer highlight.
 // @match        https://kahoot.it/*
 // @match        https://www.menti.com/*
@@ -101,6 +101,7 @@
     maxSearches:   { key: "kahoot-ai-max-searches",   fallback: MAX_SEARCHES,      min: 1,     max: 10 },
     timeout:       { key: "kahoot-ai-timeout",        fallback: API_TIMEOUT_MS,    min: 5000,  max: 120000 },
     searchTimeout: { key: "kahoot-ai-search-timeout", fallback: SEARCH_TIMEOUT_MS, min: 10000, max: 180000 },
+    location:      { key: "kahoot-ai-location",       fallback: true },   // send the time zone with web searches
     trace:         { key: "kahoot-ai-trace",          fallback: TRACE },
   };
   const prefs = {};
@@ -124,7 +125,7 @@
     renderControls();
     renderUi();
     if (name === "highlight") syncMark();
-    if (["model", "effort", "webSearch", "fast", "maxSearches", "prefetch"].includes(name)) schedulePrefetch();
+    if (["model", "effort", "webSearch", "fast", "maxSearches", "location", "prefetch"].includes(name)) schedulePrefetch();
     console.log(LOG, name, "=", value);
   }
 
@@ -224,6 +225,36 @@
     console.log(LOG, arrow, item.channel, `data.id=${item.data?.id}`, String(item.data?.content ?? "").slice(0, 300));
   }
 
+  // A picture on a question or a choice, as an address Claude can fetch: an https address, or an object
+  // holding one, or the id of one of Kahoot's own pictures (they live at media.kahoot.it). These names
+  // are the ones Kahoot's quiz format uses; a live game's messages haven't been checked for them, so a
+  // picture that isn't read is logged (see unreadPicture). SVGs and inline data aren't pictures Claude
+  // takes, and a picture it can't take would fail a question that the text answers.
+  const KAHOOT_MEDIA = "https://media.kahoot.it/";
+  const UNSUPPORTED_PICTURE = /^data:|\.svg(\?|#|$)/i;
+  function kahootPicture(value, depth = 0) {
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)) return KAHOOT_MEDIA + text;
+      if (!/^(https:)?\/\//i.test(text) || UNSUPPORTED_PICTURE.test(text)) return null;
+      try { return new URL(text, "https://kahoot.it/").href; } catch (_) { return null; }
+    }
+    if (!value || typeof value !== "object" || depth > 1) return null;
+    for (const key of ["url", "src", "fullUrl", "id"]) {
+      const found = kahootPicture(value[key], depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  // What a block holds under a name that suggests a picture, when none was read from it. Empty fields
+  // (a blank address, metadata with nothing in it) are no picture.
+  const filled = (value) => typeof value === "string" ? !!value.trim() : !!value && typeof value === "object" && Object.values(value).some(filled);
+  function unreadPicture(what, block) {
+    const held = Object.entries(block ?? {}).filter(([key, value]) => /image|picture/i.test(key) && filled(value));
+    if (held.length) console.log(LOG, `${what} has a picture I couldn't read:`, JSON.stringify(Object.fromEntries(held)).slice(0, 300));
+  }
+
   function handleKahootMessages(data, source) {
     for (const item of Array.isArray(data) ? data : [data]) {
       if (!item) continue;
@@ -247,14 +278,21 @@
         continue;
       }
 
-      const answers = block.choices.map((c, index) => ({
-        index,
-        text: cleanText(typeof c === "string" ? c : c?.answer ?? c?.text ?? "")
-      }));
-      if (!question || answers.every(a => !a.text)) continue;
+      const image = kahootPicture(block.image);
+      if (!image) unreadPicture("The question", block);
+      const answers = block.choices.map((c, index) => {
+        const choice = c && typeof c === "object" ? c : {};
+        const picture = kahootPicture(choice.image);
+        if (!picture) unreadPicture(`Answer ${LETTERS[index]}`, choice);
+        return { index, text: cleanText(typeof c === "string" ? c : choice.answer ?? choice.text ?? ""), image: picture };
+      });
+      // A question can be only a picture, and so can its answers.
+      if ((!question && !image) || answers.every(a => !a.text && !a.image)) continue;
 
-      incoming = { seq: ++seq, source, question, answers, time: Number(block.time) || 0 };
-      console.log(LOG, `Question via ${source}:`, question);
+      // Without text a question is known by its picture, so a redelivered one is still seen as a repeat.
+      incoming = { seq: ++seq, source, question, image, answers, time: Number(block.time) || 0, ...(!question && { key: textKey(image) }) };
+      const pictures = [image, ...answers.map((a) => a.image)].filter(Boolean).length;
+      console.log(LOG, `Question via ${source}:`, question || "(a picture)", pictures ? `(${pictures} ${pictures === 1 ? "picture" : "pictures"})` : "");
     }
   }
 
@@ -627,11 +665,27 @@
     const answers = [];
     for (let i = 0; i < 4; i++) {
       const el = choiceTextEl(i);
-      if (el) answers.push({ index: i, text: el.textContent.trim() });
+      const text = el ? el.textContent.trim() : "";
+      // Only a button with no text is read for a picture: where there's text it answers, and a button's
+      // own icons aren't an answer.
+      const button = text ? null : buttonFor(i);
+      const image = button ? pictureIn(button) : null;
+      if (el || image) answers.push({ index: i, text, image });
     }
 
     if (answers.length === 0) return null;
     return { question, answers };
+  }
+
+  // The picture on an answer button: an <img>, or a background image on the button or just under it.
+  function pictureIn(button) {
+    const img = button.querySelector("img[src]");
+    if (img) return kahootPicture(img.currentSrc || img.src);
+    for (const node of [button, ...button.querySelectorAll("*")].slice(0, 20)) {
+      const url = getComputedStyle(node).backgroundImage.match(/url\(["']?([^"')]+)["']?\)/)?.[1];
+      if (url) return kahootPicture(url);
+    }
+    return null;
   }
 
   // Wording differs a little between the wire and the page (spacing, case, markup, entities), so
@@ -868,6 +922,26 @@ ${lettered(q.groups)}`,
     }
   }
 
+  // Where the player is, for web searches that have local answers (how many shops a chain has where they
+  // live): their time zone, which says roughly where without a city, and without a country code the API
+  // would refuse if it were wrong. "UTC" and the "Etc/" zones say nothing, so they're left out.
+  const TIME_ZONE = (() => {
+    try {
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      return /^[A-Za-z_]+\/[A-Za-z0-9_+\-/]+$/.test(zone) && !zone.startsWith('Etc/') ? zone : '';
+    } catch (_) { return ''; }
+  })();
+  let locationRefused = false; // the API turned the time zone down: leave it out from now on
+  const searchLocation = () => prefs.location && TIME_ZONE && !locationRefused
+    ? { user_location: { type: 'approximate', timezone: TIME_ZONE } } : {};
+
+  // Pictures on a Kahoot question are extra: the text answers without them. When they can't be sent, ask
+  // without them rather than lose a question that was answerable before pictures were read. (AhaSlides'
+  // questions can be only pictures, so there they're needed.)
+  const textEnough = (q) => SITE === 'kahoot' && !!q.question && (q.answers ?? []).every((a) => a.text);
+  // The same question with its pictures taken off, so it doesn't point at pictures that aren't there.
+  const bare = (q) => ({ ...q, image: null, answers: q.answers.map((a) => ({ ...a, image: null })) });
+
   // Claude's answer: an answer's number for multiple choice, otherwise whatever that kind's read gives.
   // Null when the reply has no usable answer.
   async function askClaude(data, { search = prefs.webSearch } = {}) {
@@ -877,9 +951,10 @@ ${lettered(q.groups)}`,
       throw error;
     }
     let fast = prefs.fast && fastModel();
-    const prompt = `You are answering a quiz question. ${search ? SEARCH_LEAD : ''}${kindOf(data).ask(data)}`;
+    const promptFor = (q) => `You are answering a quiz question. ${search ? SEARCH_LEAD : ''}${kindOf(q).ask(q)}`;
+    const prompt = promptFor(data.withoutPictures ? bare(data) : data);
     // Pictures go first, then the question that names them.
-    const pictures = pictureBlocks(data);
+    const pictures = data.withoutPictures ? [] : pictureBlocks(data);
     let inlined = false;
 
     const body = {
@@ -888,7 +963,7 @@ ${lettered(q.groups)}`,
       messages: [{ role: 'user', content: pictures.length ? [...pictures, { type: 'text', text: prompt }] : prompt }],
       output_config: { effort: prefs.effort },
     };
-    if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: prefs.maxSearches }];
+    if (search) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: prefs.maxSearches, ...searchLocation() }];
     const timeoutMs = search ? prefs.searchTimeout : prefs.timeout;
 
     let json;
@@ -900,10 +975,23 @@ ${lettered(q.groups)}`,
         fast = false;
         ({ response, json: reply } = await callApi(body, false, timeoutMs));
       }
+      if (response.status === 400 && body.tools?.[0].user_location && /location|time ?zone/i.test(reply.error?.message ?? '')) {
+        console.log(LOG, 'The time zone was refused, searching without it:', reply.error.message);
+        locationRefused = true;
+        delete body.tools[0].user_location;
+        ({ response, json: reply } = await callApi(body, fast, timeoutMs));
+      }
       if (response.status === 400 && pictures.length && !inlined && /image|url|download|fetch|media/i.test(reply.error?.message ?? '')) {
         console.log(LOG, "Claude couldn't fetch the pictures, sending them from the page:", reply.error?.message);
         inlined = true;
-        body.messages[0] = { role: 'user', content: await inlinePictures(body.messages[0].content) };
+        try {
+          body.messages[0] = { role: 'user', content: await inlinePictures(body.messages[0].content) };
+        } catch (e) {
+          if (!textEnough(data)) throw e;
+          console.warn(LOG, `${e.message}, asking without them`);
+          data.withoutPictures = e.message;
+          body.messages[0] = { role: 'user', content: promptFor(bare(data)) };
+        }
         ({ response, json: reply } = await callApi(body, fast, timeoutMs));
       }
       if (response.status === 401) {
@@ -1033,7 +1121,7 @@ ${lettered(q.groups)}`,
   let prefetchBackoff = PREFETCH_RETRY_MS;
 
   // The settings an answer was asked under, then the question and its choices.
-  const settingsKey = () => [prefs.model, prefs.effort, prefs.webSearch && prefs.maxSearches, prefs.fast && fastModel()].join("/");
+  const settingsKey = () => [prefs.model, prefs.effort, prefs.webSearch && `${prefs.maxSearches}${prefs.location && TIME_ZONE ? "@" + TIME_ZONE : ""}`, prefs.fast && fastModel()].join("/");
   const cacheKey = (q) => [settingsKey(), textKey(q.question), q.answers.map((a) => textKey(a.text)).join("|")].join("/");
 
   // Asks once per question and settings, whether the question is up already or still to come. A search
@@ -1432,6 +1520,7 @@ ${lettered(q.groups)}`,
     { name: 'searchTimeout', label: 'Timeout with search', hint: 'Searching takes longer', unit: 's', scale: 1000, step: 1 },
   ];
   const ADVANCED_SWITCHES = [
+    { name: 'location', label: 'Search near me', hint: 'Sends your time zone (not your address) with web searches' },
     { name: 'trace', label: 'Debug log', hint: "Prints the game's messages in the browser console" },
   ];
   let advancedOpen = false;
@@ -2068,7 +2157,7 @@ ${lettered(q.groups)}`,
     if (incoming && incoming.seq > lastSeq) {
       const wire = incoming;
       lastSeq = wire.seq;
-      if (!isRepeat(textKey(wire.question))) return wire;
+      if (!isRepeat(keyOf(wire))) return wire;
       console.debug(LOG, 'Same question again, not asking twice:', wire.question);
     }
 
@@ -2138,8 +2227,9 @@ ${lettered(q.groups)}`,
         return;
       }
       show(kindOf(q).show(q, answer));
-      // Said with the outcome, so a search that keeps failing doesn't go unnoticed.
-      const noSearch = r.withoutSearch ? ` — no web search (${r.withoutSearch})` : '';
+      // Said with the outcome, so a search that keeps failing, or pictures that won't load, don't go unnoticed.
+      const caveats = (r.withoutSearch ? ` — no web search (${r.withoutSearch})` : '')
+        + (q.withoutPictures ? ` — asked without the pictures: ${q.withoutPictures}` : '');
 
       // The question often arrives before its buttons do. On AhaSlides, it's read on the rules screen.
       say('Waiting for the answer buttons...', '#f0a500');
@@ -2158,13 +2248,13 @@ ${lettered(q.groups)}`,
       // waited on a search.
       const delay = answerDelay(q, q.source === 'dom' ? r.startedAt : r.liveAt || Date.now());
       if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
-      else say('Auto-answer is off — answer above' + noSearch);
+      else say('Auto-answer is off — answer above' + caveats);
       await sleep(delay);
       if (r.cancelled) return;
 
       // Checked here, after the wait, so flipping the switch while waiting counts.
       if (!prefs.autoAnswer) {
-        say('Auto-answer is off — answer above' + noSearch);
+        say('Auto-answer is off — answer above' + caveats);
         return;
       }
 
@@ -2172,9 +2262,9 @@ ${lettered(q.groups)}`,
         : SITE === 'aha' ? await enterAhaAnswer(q, answer, r)
         : submitAnswer(answer, button);
       if (r.cancelled) return;
-      if (result === 'sent') say('✓ Answered (sent over WebSocket)' + noSearch, '#3fb950');
-      else if (result === 'tapped') say('✓ Answered (tapped on the page)' + noSearch, '#3fb950');
-      else if (result === 'entered') say('✓ Answered (entered on the page)' + noSearch, '#3fb950');
+      if (result === 'sent') say('✓ Answered (sent over WebSocket)' + caveats, '#3fb950');
+      else if (result === 'tapped') say('✓ Answered (tapped on the page)' + caveats, '#3fb950');
+      else if (result === 'entered') say('✓ Answered (entered on the page)' + caveats, '#3fb950');
       else if (result === 'stuck') say("Couldn't enter all of it — answer above", '#f85149');
       else if (result === 'nosocket') say("Can't auto-answer: no open WebSocket (Kahoot may be on HTTP) — answer above", '#f85149');
       else say('Answer buttons were gone — answer above', '#f85149');
