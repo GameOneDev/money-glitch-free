@@ -140,6 +140,27 @@
   try { apiKey = localStorage.getItem(KEY_STORAGE) || ""; } catch (_) {}
   let editingKey = false;
 
+  // Before 4.7 the script started on Haiku 5.5 with web search off, a small part of the cost a question
+  // of Sonnet 5.5 with search. A setting is only saved once it's changed, so an install from then that already has a key
+  // and never touched those two would be moved to the dearer ones by the update. It keeps them instead,
+  // saved as if picked; they're a tap away in the panel. The mark says this has been looked at, so a key
+  // pasted later on a new install doesn't count.
+  const DEFAULTS_MARK = "kahoot-ai-defaults";
+  const EARLIER_DEFAULTS = { model: "claude-haiku-5-5", webSearch: false };
+  try {
+    if (!localStorage.getItem(DEFAULTS_MARK)) {
+      localStorage.setItem(DEFAULTS_MARK, "4.7");
+      if (apiKey) {
+        for (const [name, value] of Object.entries(EARLIER_DEFAULTS)) {
+          if (localStorage.getItem(PREFS[name].key) !== null) continue;
+          prefs[name] = value;
+          localStorage.setItem(PREFS[name].key, typeof value === "boolean" ? (value ? "1" : "0") : value);
+          console.log(LOG, `Kept ${name} = ${value} from before 4.7`);
+        }
+      }
+    }
+  } catch (_) {}
+
   function saveApiKey(value) {
     apiKey = value;
     editingKey = false;
@@ -401,6 +422,12 @@
     : document.querySelector(`[data-functional-selector="question-choice-text-${index}"]`);
   const isDisabled = (el) => !!el.disabled || el.getAttribute("aria-disabled") === "true";
   const isVisible = (el) => el.getClientRects().length > 0;
+  // Where an answer button is on screen, counting from the first. Menti's are kept in the answers' order
+  // (see matchChoices), which can differ from the order the page shows them in.
+  const screenPlace = (index) => {
+    const el = SITE === "menti" ? buttonFor(index) : null;
+    return el ? mentiScreen().els.filter((other) => other.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING).length : index;
+  };
 
   // Mentimeter's class names are generated and change, so there's nothing to select its answers by.
   // Instead, take each question learned from the traffic and look for its choices among the things on
@@ -677,6 +704,16 @@
   const lettered = (parts) => listed(parts, (i) => LETTERS[i]);
   const PAIRS_HOW = 'Reply with ONLY one line per item, its number then its letter (for example 0: B). No explanation.';
 
+  // Where a multiple choice reply gives its letters (see KINDS.choice.read). A run of letters, each maybe
+  // dressed up ("B", "(B)", "**B**"), joined by commas or "and"; a line that is only that, with
+  // "Answer:" in front or not; "answer is" or "answer:" (or "answers are", "option", "choice") followed by
+  // one, but not "option A" alone, which can be a mention; and a line that starts with one, followed by
+  // anything but a word.
+  const letterRun = (letter) => String.raw`[*_\x60(\["']*${letter}[*_\x60)\]"']*(?:\s*(?:,|;|&|\/|\band\b)\s*[*_\x60(\["']*${letter}[*_\x60)\]"']*)*`;
+  const ONLY_LETTERS = new RegExp(String.raw`^(?:[*_]*answers?[*_]*\s*[:=\-–—]?[*_]*\s*)?(${letterRun('[A-Za-z]')})\s*[.!]*$`, 'i');
+  const NAMED_LETTERS = new RegExp(String.raw`\b(?:[Aa]nswers?|[Oo]ptions?|[Cc]hoices?)[*_]*(?:\s+(?:is|are|would be|should be)\s*[:\-–—]?|\s*[:=\-–—])[*_]*\s*(${letterRun('[A-Z]')})(?![\p{L}\p{N}])`, 'gu');
+  const LEADING_LETTERS = new RegExp(String.raw`^(${letterRun('[A-Z]')})(?=\s*(?:$|[^\p{L}\p{N}\s]))`, 'u');
+
   // Each item's letter, as { item index: other index }, or null unless every item got one. Pairs can be
   // written "0: B", "0 - B", "0 → B" and so on, and a later pair for the same item wins.
   function readPairs(items, others, text, oneEach) {
@@ -706,16 +743,27 @@ Question: ${asked(q)}
 
 Answers:
 ${lettered(q.answers)}`,
-      // A lone letter on the last line, plain or dressed up ("B", "(B)", "**B**", "Answer: B"); failing that,
-      // the last capital letter that is one of the answers, so an "A" starting a sentence can't win over
-      // the letter after it. With several right, every answer's letter on the last line that has any.
+      // With search the reply often explains itself, and its words have capitals too ("A search confirms
+      // it", "Vitamin C"), so the letters are looked for where an answer is given, in this order: the last
+      // line that is only letters ("B", "(B)", "**B**", "Answer: B", "B and D"); the last "answer is B"; the
+      // last line that starts with them ("**B** - Paris"). Failing those, the last capital that is one of
+      // the answers, leaving out an "A" or "I" that starts a sentence as a word. With several right, every
+      // letter found there, or failing that every answer's letter on the last line that has any.
       read: (q, text) => {
         const index = new Map(q.answers.map((a) => [LETTERS[a.index], a.index]));
-        const capitals = (s) => [...s.matchAll(/\b([A-Z])\b/g)].map((m) => m[1]).filter((l) => index.has(l));
+        // The answers a run of letters names, or null unless it names one (any number when several can be
+        // right) and every letter in it is an answer's.
+        const picks = (run) => {
+          const letters = [...new Set(run.toUpperCase().match(/\b[A-Z]\b/g) ?? [])];
+          return letters.length && (q.multi || letters.length === 1) && letters.every((l) => index.has(l)) ? letters.map((l) => index.get(l)) : null;
+        };
         const lines = text.split('\n').map((l) => l.trim()).filter(Boolean).reverse();
-        if (q.multi) return lines.map((line) => [...new Set(capitals(line))].map((l) => index.get(l))).find((picks) => picks.length) ?? null;
-        const lone = lines[0]?.match(/^(?:answer\W*)?[\s*_`(["']*([A-Za-z])[\s*_`)\]"'.:,!]*$/i)?.[1].toUpperCase();
-        if (lone && index.has(lone)) return index.get(lone);
+        const found = lines.map((line) => line.match(ONLY_LETTERS)?.[1]).map((run) => run && picks(run)).find(Boolean)
+          ?? [...text.matchAll(NAMED_LETTERS)].map((m) => picks(m[1])).filter(Boolean).pop()
+          ?? lines.map((line) => line.match(LEADING_LETTERS)?.[1]).map((run) => run && picks(run)).find(Boolean);
+        if (found) return q.multi ? found : found[0];
+        const capitals = (s) => [...s.replace(/(^|[.!?]\s+)[AI](?=\s+[a-z])/g, '$1').matchAll(/\b([A-Z])\b/g)].map((m) => m[1]).filter((l) => index.has(l));
+        if (q.multi) return lines.map((line) => [...new Set(capitals(line))].map((l) => index.get(l))).find((p) => p.length) ?? null;
         const last = capitals(text).pop();
         return last ? index.get(last) : null;
       },
@@ -906,42 +954,57 @@ ${lettered(q.groups)}`,
     return t;
   }
 
-  function startAsk(q) {
-    const search = prefs.webSearch;
-    return { deep: track(askWithRetry(q, { search })), quick: search ? track(askWithRetry(q, { search: false })) : null };
+  // Asked ahead, there's no quick answer yet (see addQuick).
+  function startAsk(q, { ahead = false } = {}) {
+    const entry = { deep: track(askWithRetry(q, { search: prefs.webSearch })), quick: null, search: prefs.webSearch };
+    return ahead ? entry : addQuick(entry, q);
+  }
+
+  // The quick answer is only asked for once the question is up and the search isn't back: with minutes
+  // to go the search nearly always wins, and the quick answer would be paid for and thrown away.
+  function addQuick(entry, q) {
+    if (entry.search && !entry.quick && !usable(entry.deep)) entry.quick = track(askWithRetry(q, { search: false }));
+    return entry;
   }
 
   const usable = (t) => !!t && t.done && !t.error && t.value !== null;
+  const failed = (t) => !!t && t.done && !usable(t);
   // An answer is in hand: the searched one, or the quick one once the searched one has given up.
   const ready = (entry) => usable(entry.deep) || (entry.deep.done && usable(entry.quick));
 
-  // The question is up and can be answered now.
-  function questionLive(q) {
-    if (SITE === 'aha') return ahaLive(q);
-    const el = buttonFor(0);
-    return !!el && !isDisabled(el) && locateButton(q, 0) >= 0;
+  // Whether the question has gone live: its buttons are on screen, enabled or not (Kahoot shows them a
+  // moment before it takes answers, and some never look enabled), or on AhaSlides its slide is on the
+  // question screen. The first time that's seen is taken as when its timer started, r.liveAt, and both
+  // the grace for a slow search and the answer delay count from then. Every wait for the question
+  // checks it, so whichever is running when it goes live notes the time.
+  function seenLive(q, r) {
+    if (!r.liveAt && (SITE === 'aha' ? ahaLive(q) : locateButton(q, 0) >= 0)) r.liveAt = Date.now();
+    return !!r.liveAt;
   }
 
   // The answer to a started question: the searched one when it comes, else the quick one once the question
-  // has been live for the grace period, or at once if the search failed. Throws what the attempts threw.
+  // has been live for the grace period, or once the search has failed. Throws what the attempts threw.
+  // When the quick answer is used, r.withoutSearch says why.
   async function answerBy(entry, q, r) {
     const { deep, quick } = entry;
     const grace = q.time ? Math.max(0, Math.min(SEARCH_GRACE_MS, q.time - prefs.margin)) : SEARCH_GRACE_MS;
-    let liveSince = 0;
     while (!r.cancelled) {
+      seenLive(q, r);
       if (usable(deep)) return deep.value;
-      if (deep.done) {
-        if (quick) await quick.promise;
-        if (usable(quick)) return quick.value;
+      if (deep.done && (!quick || quick.done)) {
+        if (usable(quick)) {
+          const why = deep.error?.message ?? 'no usable answer';
+          console.warn(LOG, 'The search failed, using the quick answer:', why);
+          r.withoutSearch = `failed: ${why}`;
+          return quick.value;
+        }
         if (deep.error || quick?.error) throw deep.error ?? quick.error;
         return null;
       }
-      if (usable(quick) && questionLive(q)) {
-        liveSince ||= Date.now();
-        if (Date.now() - liveSince >= grace) {
-          console.log(LOG, 'The search is taking long, using the quick answer');
-          return quick.value;
-        }
+      if (usable(quick) && r.liveAt && Date.now() - r.liveAt >= grace) {
+        console.log(LOG, 'The search is taking long, using the quick answer');
+        r.withoutSearch = 'too slow';
+        return quick.value;
       }
       await sleep(40);
     }
@@ -954,60 +1017,81 @@ ${lettered(q.groups)}`,
   // Claude's thinking out of the time the question is on screen. Answers are kept by question, choices
   // and settings, so changing the model asks again.
   const PREFETCH_PARALLEL = 2;
+  // The most questions asked ahead under the same settings.
   const PREFETCH_MAX = 60;
-  const answerCache = new Map(); // key -> { deep, quick }
+  // A question whose search keeps failing ahead is left until it comes up.
+  const PREFETCH_TRIES = 3;
+  // After a failure (a rate limit, a dropped connection) nothing more is asked ahead for this long,
+  // doubling with each failure in a row.
+  const PREFETCH_RETRY_MS = 2000;
+  const PREFETCH_RETRY_MAX_MS = 60000;
+  const answerCache = new Map(); // key -> { deep, quick, search, tries }
   let prefetching = 0;
   let prefetchTimer = 0;
   let prefetchHalted = false; // the key was refused: stop until there's a new one
+  let prefetchRetryAt = 0;
+  let prefetchBackoff = PREFETCH_RETRY_MS;
 
-  const cacheKey = (q) => [
-    prefs.model, prefs.effort, prefs.webSearch && prefs.maxSearches, prefs.fast && fastModel(),
-    textKey(q.question), q.answers.map((a) => textKey(a.text)).join("|"),
-  ].join("/");
+  // The settings an answer was asked under, then the question and its choices.
+  const settingsKey = () => [prefs.model, prefs.effort, prefs.webSearch && prefs.maxSearches, prefs.fast && fastModel()].join("/");
+  const cacheKey = (q) => [settingsKey(), textKey(q.question), q.answers.map((a) => textKey(a.text)).join("|")].join("/");
 
-  // Asks once per question and settings, whether the question is up already or still to come.
-  function askCached(q) {
+  // Asks once per question and settings, whether the question is up already or still to come. A search
+  // that failed is asked again, keeping a quick answer already in hand or on its way.
+  function askCached(q, { ahead = false } = {}) {
     const key = cacheKey(q);
     let entry = answerCache.get(key);
-    if (!entry) {
-      entry = startAsk(q);
+    if (!entry || failed(entry.deep)) {
+      const quick = entry?.quick && !failed(entry.quick) ? entry.quick : null;
+      entry = { ...startAsk(q, { ahead: true }), quick, tries: (entry?.tries ?? 0) + 1 };
       answerCache.set(key, entry);
-      // Nothing usable at the end isn't kept: it's asked again when the question is up.
-      Promise.all([entry.deep.promise, entry.quick?.promise]).then(() => { if (!ready(entry)) answerCache.delete(key); });
     }
-    return entry;
+    return ahead ? entry : addQuick(entry, q);
   }
 
   // Only the questions known to be quiz questions with choices; a poll has no right answer, and a
   // question of unknown type is left until it's on screen.
   const prefetchable = (q) => MENTI_QUIZ_TYPE.test(q.type) && !MENTI_TYPED_ANSWER.test(q.type);
 
-  function schedulePrefetch() {
+  function schedulePrefetch(delay = 50) {
     if (SITE !== "menti" || prefetchTimer) return;
-    prefetchTimer = setTimeout(() => { prefetchTimer = 0; pumpPrefetch(); }, 50);
+    prefetchTimer = setTimeout(() => { prefetchTimer = 0; pumpPrefetch(); }, delay);
   }
 
-  // Keeps a couple of questions going at a time, the one that's up first.
+  // Keeps a couple of questions going at a time, from the one that's up on: the ones before it have been
+  // played. Until the traffic names a question that's up, every question.
   function pumpPrefetch() {
     if (SITE !== "menti" || !prefs.prefetch || !apiKey || prefetchHalted) return;
-    const queue = [...mentiQuestions.values()].filter(prefetchable)
-      .sort((a, b) => Number(b.ids.includes(mentiActive)) - Number(a.ids.includes(mentiActive)));
+    const wait = prefetchRetryAt - Date.now();
+    if (wait > 0) { schedulePrefetch(wait); return; }
+    const known = [...mentiQuestions.values()];
+    const queue = known.slice(Math.max(0, known.findIndex((q) => q.ids.includes(mentiActive)))).filter(prefetchable);
+    const settings = settingsKey() + "/";
+    let asked = [...answerCache.keys()].filter((key) => key.startsWith(settings)).length;
     for (const q of queue) {
-      if (prefetching >= PREFETCH_PARALLEL || answerCache.size >= PREFETCH_MAX) break;
+      if (prefetching >= PREFETCH_PARALLEL) break;
       const data = { question: q.question, answers: q.answers, source: "wire" };
-      if (answerCache.has(cacheKey(data))) continue;
+      const entry = answerCache.get(cacheKey(data));
+      if (entry && (!failed(entry.deep) || entry.tries >= PREFETCH_TRIES)) continue;
+      if (!entry && asked++ >= PREFETCH_MAX) break;
       prefetching++;
       const started = Date.now();
-      // Only a finished answer starts the next one, so a failing connection can't loop.
-      const { deep } = askCached(data);
+      // Only a finished answer starts the next one at once. After a failure the next waits, longer each
+      // time, so a failing connection or a rate limit can't loop.
+      const { deep } = askCached(data, { ahead: true });
       deep.promise.then(() => {
         prefetching--;
         if (usable(deep)) {
+          prefetchBackoff = PREFETCH_RETRY_MS;
           console.log(LOG, `Asked ahead (${((Date.now() - started) / 1000).toFixed(1)}s):`, q.question, "→", kindOf(data).show(data, deep.value));
           pumpPrefetch();
+        } else if (deep.error?.fatal) {
+          prefetchHalted = true;
         } else {
-          if (deep.error?.fatal) prefetchHalted = true;
-          console.debug(LOG, "Couldn't ask ahead:", deep.error?.message ?? "no usable answer");
+          console.debug(LOG, `Couldn't ask ahead, trying again in ${prefetchBackoff / 1000}s:`, deep.error?.message ?? "no usable answer");
+          prefetchRetryAt = Date.now() + prefetchBackoff;
+          schedulePrefetch(prefetchBackoff);
+          prefetchBackoff = Math.min(prefetchBackoff * 2, PREFETCH_RETRY_MAX_MS);
         }
       });
     }
@@ -1048,6 +1132,7 @@ ${lettered(q.groups)}`,
     let found = -1;
     let reported = false;
     while (!r.cancelled && Date.now() < deadline) {
+      seenLive(q, r);
       found = locateButton(q, index);
       if (found >= 0) {
         r.sawButtons = true;
@@ -1168,8 +1253,8 @@ ${lettered(q.groups)}`,
     for (const deadline = Date.now() + BUTTON_WAIT_MS; !r.cancelled && Date.now() < deadline; await sleep(100)) {
       const slide = ahaSlide();
       if (String(slide?.id) !== q.slideId || slide.quizStatus > AHA_STATUS.question) break;
+      seenLive(q, r);
       if (!ahaLive(q)) continue;
-      r.liveAt ||= Date.now();
       const controls = AHA_CONTROLS[q.kind ?? 'choice'](q, answer);
       if (!controls) continue;
       console.log(LOG, `Answer controls are up after ${Date.now() - r.startedAt}ms`);
@@ -1495,7 +1580,7 @@ ${lettered(q.groups)}`,
     box.replaceChildren(...positions.map((position) => {
       const badge = document.createElement('span');
       badge.className = 'pick';
-      badge.textContent = String(position + 1);
+      badge.textContent = String(screenPlace(position) + 1);
       const color = buttonColor(buttonFor(position));
       if (color) {
         badge.style.background = color.css;
@@ -2053,6 +2138,8 @@ ${lettered(q.groups)}`,
         return;
       }
       show(kindOf(q).show(q, answer));
+      // Said with the outcome, so a search that keeps failing doesn't go unnoticed.
+      const noSearch = r.withoutSearch ? ` — no web search (${r.withoutSearch})` : '';
 
       // The question often arrives before its buttons do. On AhaSlides, it's read on the rules screen.
       say('Waiting for the answer buttons...', '#f0a500');
@@ -2066,15 +2153,18 @@ ${lettered(q.groups)}`,
       r.pick = button ?? undefined; // AhaSlides has nothing to highlight but multiple choice
       syncMark();
       if (!r.cancelled) setPicks(picksOnScreen(q, answer, button));
-      const delay = answerDelay(q, SITE === 'aha' ? r.liveAt : q.source === 'dom' ? r.startedAt : Date.now());
+      // A question read off the page was already up when its round started; one from the wire or
+      // AhaSlides' store went live at r.liveAt (see seenLive), which may be a while back if the answer
+      // waited on a search.
+      const delay = answerDelay(q, q.source === 'dom' ? r.startedAt : r.liveAt || Date.now());
       if (prefs.autoAnswer) say(`Answering in ${(delay / 1000).toFixed(1)}s...`, '#f0a500');
-      else say('Auto-answer is off — answer above');
+      else say('Auto-answer is off — answer above' + noSearch);
       await sleep(delay);
       if (r.cancelled) return;
 
       // Checked here, after the wait, so flipping the switch while waiting counts.
       if (!prefs.autoAnswer) {
-        say('Auto-answer is off — answer above');
+        say('Auto-answer is off — answer above' + noSearch);
         return;
       }
 
@@ -2082,9 +2172,9 @@ ${lettered(q.groups)}`,
         : SITE === 'aha' ? await enterAhaAnswer(q, answer, r)
         : submitAnswer(answer, button);
       if (r.cancelled) return;
-      if (result === 'sent') say('✓ Answered (sent over WebSocket)', '#3fb950');
-      else if (result === 'tapped') say('✓ Answered (tapped on the page)', '#3fb950');
-      else if (result === 'entered') say('✓ Answered (entered on the page)', '#3fb950');
+      if (result === 'sent') say('✓ Answered (sent over WebSocket)' + noSearch, '#3fb950');
+      else if (result === 'tapped') say('✓ Answered (tapped on the page)' + noSearch, '#3fb950');
+      else if (result === 'entered') say('✓ Answered (entered on the page)' + noSearch, '#3fb950');
       else if (result === 'stuck') say("Couldn't enter all of it — answer above", '#f85149');
       else if (result === 'nosocket') say("Can't auto-answer: no open WebSocket (Kahoot may be on HTTP) — answer above", '#f85149');
       else say('Answer buttons were gone — answer above', '#f85149');
